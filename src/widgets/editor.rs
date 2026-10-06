@@ -1,42 +1,48 @@
+//! The text area: a scrolling, multi-line view over a [`TextState`].
+//!
+//! The state behind it is split across three files, each with one job:
+//!
+//! * [`motion`] — cursor movements, decoupled from the keys that trigger them;
+//! * [`history`] — the undo/redo stacks and the transactions that feed them;
+//! * [`overlay`] — the spans a selection covers on the visible rows;
+//! * [`welcome`] — the greeting drawn in an empty scratch buffer.
+//!
+//! What is left here is the view: how the viewport is scrolled, where the
+//! terminal cursor goes, what a key press does to the buffer and which
+//! [`Action`]s the editor has queued.
+
+mod history;
+mod motion;
+mod overlay;
+mod welcome;
+
+#[cfg(test)]
+mod tests;
+
 use std::path::PathBuf;
 
+use crate::Cursor;
 use crate::action::{Action, Actions};
+use crate::clipboard::{Clipboard, ClipboardBackendKind};
 use crate::component::Component;
-use crate::text::TextState;
+use crate::highlight::{LayerId, StyledRun};
+use crate::text::{Selection, SelectionMode, TextState};
 use crate::widgets::viewport::gutter_width;
 use crate::widgets::{Viewport, ViewportState};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Offset, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
 use unicode_width::UnicodeWidthStr;
 
-/// Lines jumped by PageUp / PageDown.
-const PAGE_SIZE: usize = 20;
+use history::History;
+use motion::Motion;
 
-/// Welcome drawn while the scratch buffer is empty, in the spirit of vim's
-/// splash: what the editor is, then the keys that get you started. Typing the
-/// first character replaces it.
-const WELCOME_LINES: &[&str] = &[
-    env!("CARGO_PKG_NAME"),
-    concat!("version ", env!("CARGO_PKG_VERSION")),
-    "",
-    "Ctrl+O        open file",
-    "Ctrl+Shift+O  open folder",
-    "Ctrl+S        save",
-    "Ctrl+Shift+S  save as",
-    "Ctrl+B        toggle file tree",
-    "Ctrl+Shift+Q  commands",
-    "Esc           quit",
-];
-
-/// The welcome's first line stands out; the hints stay dim, like the file
-/// tree's placeholder.
-const TITLE_STYLE: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
-const HINT_STYLE: Style = Style::new().fg(Color::DarkGray);
+/// Text inserted by the Tab key. Hardcoded to four spaces for now; a later
+/// revision will make the indentation (tabs vs spaces, width) user-configurable.
+const TAB_INDENT: &str = "    ";
 
 /// The text area: a scrolling, multi-line view over a [`TextState`].
 #[derive(Debug, Default)]
@@ -46,11 +52,17 @@ impl Component for Editor {
     type State = EditorState;
 
     fn handle_event(self, event: &Event, state: &mut Self::State) {
-        let Some(key) = crate::utils::key_press(event) else {
-            return;
-        };
-
-        state.handle_key(key.code, key.modifiers);
+        match event {
+            // Terminal bracketed paste delivers the system clipboard contents
+            // straight to the buffer.
+            Event::Paste(text) => state.paste_text(text),
+            _ => {
+                let Some(key) = crate::utils::key_press(event) else {
+                    return;
+                };
+                state.handle_key(key.code, key.modifiers);
+            }
+        }
     }
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
@@ -91,25 +103,54 @@ impl Component for Editor {
         };
         state.viewport_state.height = content_area.height as usize;
 
+        // The viewport dimensions are only known now, at render time, so the
+        // vertical scrollbar's content length and thumb position must be
+        // recomputed here. Without this, the first render (and any later render
+        // after a resize or a freshly loaded file) would draw the scrollbar from
+        // the stale default state until the next key press updates it.
+        state.update_scrollbar_state();
+
+        // Rebuild the selection overlay only when it changed (a selection was
+        // made, extended, collapsed, or the cursor moved inside one). With no
+        // selection the overlay is cleared so the editor renders byte-for-byte as
+        // it did before this feature existed.
+        if state.selection_dirty {
+            if state.selection.is_active() {
+                state.recompute_selection_overlay();
+            } else {
+                state
+                    .viewport_state
+                    .highlights
+                    .clear_layer(LayerId::Overlay);
+                state.viewport_state.highlights.set_enabled(false);
+            }
+            state.selection_dirty = false;
+        }
+
         // Render the viewport widget (content without scrollbars)
         let viewport = Viewport::new(&state.text.lines).active_line(state.text.cursor.y);
         StatefulWidget::render(viewport, content_area, buf, &mut state.viewport_state);
 
         // An empty scratch buffer is a blank page: greet the user the way vim
-        // does instead of leaving it bare.
-        if is_empty_scratch(state)
-            && let Some(area) = welcome_area(content_area)
+        // does instead of leaving it bare. The hints come from the shortcut
+        // registry, so they always match the real bindings.
+        if welcome::is_empty_scratch(state.path.as_deref(), &state.text.lines)
+            && let Some(area) = welcome::welcome_area(content_area)
         {
             // One borrowed span per line: `Paragraph` would need an owned
             // `Text`, which clones every line on every frame.
-            for (index, line) in WELCOME_LINES.iter().enumerate() {
-                let style = if index == 0 { TITLE_STYLE } else { HINT_STYLE };
+            for (index, line) in welcome::welcome_lines().iter().enumerate() {
+                let style = if index == 0 {
+                    welcome::TITLE_STYLE
+                } else {
+                    welcome::HINT_STYLE
+                };
                 let row = Rect {
                     y: area.y + index as u16,
                     height: 1,
                     ..area
                 };
-                Span::styled(*line, style).render(row, buf);
+                Span::styled(line.as_str(), style).render(row, buf);
             }
         }
 
@@ -152,36 +193,6 @@ impl Component for Editor {
     }
 }
 
-/// True while this is the never-saved startup buffer with nothing typed into it.
-fn is_empty_scratch(state: &EditorState) -> bool {
-    state.path.is_none() && state.text.lines.iter().all(String::is_empty)
-}
-
-/// Where the welcome block goes: centered, or `None` when it does not fit.
-fn welcome_area(area: Rect) -> Option<Rect> {
-    let width = WELCOME_LINES
-        .iter()
-        .map(|line| UnicodeWidthStr::width(*line))
-        .max()
-        .unwrap_or(0) as u16;
-
-    centered_block(area, width, WELCOME_LINES.len() as u16)
-}
-
-/// A `width` x `height` rect centered in `area`, or `None` when it does not fit.
-fn centered_block(area: Rect, width: u16, height: u16) -> Option<Rect> {
-    if width == 0 || height == 0 || width > area.width || height > area.height {
-        return None;
-    }
-
-    Some(Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
-    })
-}
-
 /// Everything [`Editor`] needs to draw and edit itself.
 ///
 /// The text lives in [`TextState`], shared with [`Input`](crate::widgets::Input);
@@ -196,11 +207,25 @@ pub struct EditorState {
     pub path: Option<PathBuf>,
     /// Whether the buffer holds edits not yet written to disk.
     pub dirty: bool,
+    /// Monotonic document version, bumped on every edit. Asynchronous color
+    /// producers (a future LSP) stamp their responses with the version they
+    /// were computed against; a mismatch means the data is stale and is dropped.
+    pub version: u64,
     pub(crate) viewport_state: ViewportState,
     pub(crate) scrollbar_state: ScrollbarState,
     pub(crate) h_scrollbar_state: ScrollbarState,
     pub(crate) cursor_screen_pos: Option<Position>,
+    /// The active text selection; `mode == None` means no selection.
+    selection: Selection,
+    /// Clipboard: mirrors to the system and to an internal register.
+    clipboard: Clipboard,
+    /// Whether the selection overlay must be recomputed before the next render.
+    selection_dirty: bool,
+    /// Reused buffer for [`Self::recompute_selection_overlay`], so steady-state
+    /// recomputation allocates nothing beyond the first time.
+    selection_rows: Vec<Vec<StyledRun>>,
     actions: Actions,
+    history: History,
 }
 
 impl EditorState {
@@ -224,64 +249,349 @@ impl EditorState {
     /// Replaces the buffer with a freshly loaded file and resets the view.
     pub fn load_file(&mut self, path: PathBuf, lines: Vec<String>) {
         self.text.load(lines);
+        // A freshly loaded buffer has no coloring yet; rebuild the index to the
+        // new line count so stale runs from the previous file cannot leak in.
+        self.viewport_state.highlights.reset(self.text.lines.len());
         self.path = Some(path);
         self.dirty = false;
+        // A new file is a clean slate: drop any history so undo cannot reach
+        // into the previous buffer, and mark the (empty) history as saved.
+        self.history.reset();
         self.viewport_state.scroll_x = 0;
         self.viewport_state.scroll_y = 0;
         self.viewport_state.curr_line = 0;
         self.scrollbar_state = ScrollbarState::default();
         self.h_scrollbar_state = ScrollbarState::default();
         self.cursor_screen_pos = None;
+        // A freshly loaded file has no selection and no stale overlay.
+        self.selection_clear();
     }
 
     /// Called after a successful write to disk.
     pub fn mark_saved(&mut self) {
         self.dirty = false;
+        // Anchor the saved point to the current position in history, so an undo
+        // that returns the buffer to this state clears `dirty` again.
+        self.history.mark_saved();
     }
 
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        // Editing keys flip the dirty flag; movement keys must leave it alone.
-        let mut edited = false;
+        use KeyModifiers as M;
 
+        // 1) Copy / cut / paste / select-all. These must be intercepted before the
+        //    character-insert fallback, which would otherwise swallow Ctrl+C / X /
+        //    V / A as literal input.
+        if modifiers.contains(M::CONTROL) {
+            match code {
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.copy();
+                    return;
+                }
+                KeyCode::Char('x') | KeyCode::Char('X') => {
+                    self.cut();
+                    return;
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    self.paste();
+                    return;
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.select_all();
+                    return;
+                }
+                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    // Ctrl+Z undoes; the widely expected Ctrl+Shift+Z redoes.
+                    if modifiers.contains(M::SHIFT) {
+                        self.redo();
+                    } else {
+                        self.undo();
+                    }
+                    return;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.redo();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Shift+Insert pastes (xterm convention).
+        if !modifiers.contains(M::CONTROL)
+            && modifiers.contains(M::SHIFT)
+            && code == KeyCode::Insert
+        {
+            self.paste();
+            return;
+        }
+
+        // 2) Movement, or selection extension when Shift is held.
+        if let Some(motion) = Motion::from(modifiers, code) {
+            if modifiers.contains(M::SHIFT) {
+                if !self.selection.is_active() {
+                    self.selection_begin(SelectionMode::Char);
+                }
+                motion.apply(&mut self.text);
+            } else {
+                if self.selection.is_active() {
+                    self.selection_clear();
+                }
+                motion.apply(&mut self.text);
+            }
+            self.after_move();
+            return;
+        }
+
+        // 3) Editing. A live selection is replaced by whatever is typed. Every
+        // edit is recorded; a single key press becomes one undo entry.
+        let had_selection = self.selection.is_active();
+        self.history.begin_txn();
         match (modifiers, code) {
             (_, KeyCode::Char(c)) => {
-                self.text.insert_char(c);
-                edited = true;
+                if had_selection {
+                    let e = self.text.delete_selection(&self.selection);
+                    self.history.record(e);
+                    self.selection_clear();
+                }
+                let e = self.text.insert_char(c);
+                self.history.record(e);
             }
-            (KeyModifiers::NONE, KeyCode::Backspace) => {
-                self.text.delete_backward();
-                edited = true;
+            (M::NONE, KeyCode::Enter) => {
+                if had_selection {
+                    let e = self.text.delete_selection(&self.selection);
+                    self.history.record(e);
+                    self.selection_clear();
+                }
+                let e = self.text.insert_new_line();
+                self.history.record(e);
             }
-            (KeyModifiers::NONE, KeyCode::Delete) => {
-                self.text.delete_forward();
-                edited = true;
+            (M::NONE, KeyCode::Tab) => {
+                // Tab inserts indentation instead of moving focus; focus cycling
+                // is Shift+Tab (handled by the shell). A live selection is
+                // replaced by the indentation, like any other typed text.
+                if had_selection {
+                    let e = self.text.delete_selection(&self.selection);
+                    self.history.record(e);
+                    self.selection_clear();
+                }
+                let e = self.text.insert_str(TAB_INDENT);
+                self.history.record(e);
             }
-            (KeyModifiers::NONE, KeyCode::Enter) => {
-                self.text.insert_new_line();
-                edited = true;
+            (M::NONE, KeyCode::Backspace) => {
+                if had_selection {
+                    let e = self.text.delete_selection(&self.selection);
+                    self.history.record(e);
+                    self.selection_clear();
+                } else {
+                    let e = self.text.delete_backward();
+                    self.history.record(e);
+                }
             }
-            (KeyModifiers::NONE, KeyCode::Up) => self.text.move_up(),
-            (KeyModifiers::NONE, KeyCode::Down) => self.text.move_down(),
-            (KeyModifiers::NONE, KeyCode::Left) => self.text.move_left(),
-            (KeyModifiers::NONE, KeyCode::Right) => self.text.move_right(),
-            (KeyModifiers::NONE, KeyCode::Home) => self.text.move_to_line_start(),
-            (KeyModifiers::NONE, KeyCode::End) => self.text.move_to_line_end(),
-            (KeyModifiers::CONTROL, KeyCode::Left) => self.text.move_word_left(),
-            (KeyModifiers::CONTROL, KeyCode::Right) => self.text.move_word_right(),
-            (KeyModifiers::CONTROL, KeyCode::Up) => self.text.move_to_text_start(),
-            (KeyModifiers::CONTROL, KeyCode::Down) => self.text.move_to_text_end(),
-            (KeyModifiers::NONE, KeyCode::PageUp) => self.text.move_page_up(PAGE_SIZE),
-            (KeyModifiers::NONE, KeyCode::PageDown) => self.text.move_page_down(PAGE_SIZE),
-            (KeyModifiers::CONTROL, KeyCode::Home) => self.text.move_to_text_start(),
-            (KeyModifiers::CONTROL, KeyCode::End) => self.text.move_to_text_end(),
+            (M::NONE, KeyCode::Delete) => {
+                if had_selection {
+                    let e = self.text.delete_selection(&self.selection);
+                    self.history.record(e);
+                    self.selection_clear();
+                } else {
+                    let e = self.text.delete_forward();
+                    self.history.record(e);
+                }
+            }
+            (M::NONE, KeyCode::Esc) => {
+                self.selection_clear();
+            }
             _ => {}
         }
+        let changed = self.history.end_txn();
 
-        if edited {
-            self.dirty = true;
+        if changed {
+            self.after_edit(self.text.cursor.y);
+        } else {
+            // An unhandled key (or Esc) leaves the document untouched.
+            self.sync();
         }
+    }
 
+    fn selection_begin(&mut self, mode: SelectionMode) {
+        self.selection.anchor = self.text.cursor;
+        self.selection.mode = mode;
+        self.selection_dirty = true;
+    }
+
+    fn selection_clear(&mut self) {
+        if self.selection.is_active() {
+            self.selection.mode = SelectionMode::None;
+            self.selection_dirty = true;
+        }
+    }
+
+    /// Records an edit: bumps the version, invalidates the coloring layer, flags
+    /// the selection overlay for recompute and resyncs the view.
+    fn after_edit(&mut self, y: usize) {
+        self.dirty = true;
+        self.version += 1;
+        self.viewport_state.highlights.note_edit(y);
+        self.selection_dirty = true;
         self.sync();
+    }
+
+    /// Records a pure movement / selection extension. The document is unchanged,
+    /// so `dirty` is left alone; only the selection overlay and view are updated.
+    fn after_move(&mut self) {
+        self.selection_dirty = true;
+        self.sync();
+    }
+
+    /// Reverts the most recent edit.
+    pub fn undo(&mut self) {
+        let Some(entry) = self.history.begin_undo() else {
+            return;
+        };
+        entry.edit.undo(&mut self.text);
+        self.history.finish_undo(entry);
+        self.after_history();
+    }
+
+    /// Re-applies the most recently undone edit.
+    pub fn redo(&mut self) {
+        let Some(entry) = self.history.begin_redo() else {
+            return;
+        };
+        entry.edit.redo(&mut self.text);
+        self.history.finish_redo(entry);
+        self.after_history();
+    }
+
+    /// Bookkeeping shared by `undo`/`redo`: the document changed, so the cached
+    /// coloring and the view refresh, the selection collapses, and `dirty` is
+    /// recomputed against the last write — undoing back onto the saved state
+    /// clears it again.
+    fn after_history(&mut self) {
+        self.version += 1;
+        self.viewport_state.highlights.note_edit(self.text.cursor.y);
+        self.selection_clear();
+        self.dirty = self.history.is_dirty();
+        self.sync();
+    }
+
+    fn copy(&mut self) {
+        let text = self.current_selection_or_line();
+        self.clipboard.copy(&text);
+        // Copying does not mutate the buffer; the selection stays so it can be
+        // pasted again.
+    }
+
+    fn cut(&mut self) {
+        let text = self.current_selection_or_line();
+        self.clipboard.copy(&text);
+
+        self.history.begin_txn();
+        if self.selection.is_active() {
+            let e = self.text.delete_selection(&self.selection);
+            self.history.record(e);
+        } else {
+            // No selection: cut the current line (VS Code behaviour). The removed
+            // span reaches into the neighbouring newline so the row disappears
+            // instead of leaving a blank one behind; on the last line the newline
+            // in front of it is taken instead.
+            let y = self.text.cursor.y;
+            let edit = if self.text.lines.len() == 1 {
+                let end = Cursor {
+                    x: self.text.lines[y].len(),
+                    y,
+                };
+                self.text.replace(Cursor { x: 0, y }, end, "")
+            } else if y + 1 < self.text.lines.len() {
+                self.text
+                    .replace(Cursor { x: 0, y }, Cursor { x: 0, y: y + 1 }, "")
+            } else {
+                let prev = Cursor {
+                    x: self.text.lines[y - 1].len(),
+                    y: y - 1,
+                };
+                let end = Cursor {
+                    x: self.text.lines[y].len(),
+                    y,
+                };
+                self.text.replace(prev, end, "")
+            };
+            self.history.record(edit);
+        }
+        self.history.end_txn();
+        self.text.clamp_cursor();
+
+        self.after_edit(self.text.cursor.y);
+        self.selection_clear();
+    }
+
+    fn paste(&mut self) {
+        let text = self.clipboard.paste_text();
+        self.insert_recorded(&text);
+    }
+
+    /// Inserts text arriving from an external source (terminal bracketed paste).
+    /// Does not touch the internal register, so a later Ctrl+V still pastes what
+    /// *we* copied. An active selection is replaced, matching `paste`.
+    fn paste_text(&mut self, text: &str) {
+        self.insert_recorded(text);
+    }
+
+    /// Shared insertion path for paste / bracketed paste: an active selection is
+    /// replaced, and the whole thing ("delete selection, insert") is one undo
+    /// entry.
+    fn insert_recorded(&mut self, text: &str) {
+        self.history.begin_txn();
+        if self.selection.is_active() {
+            let e = self.text.delete_selection(&self.selection);
+            self.history.record(e);
+        }
+        let e = self.text.insert_str(text);
+        self.history.record(e);
+        self.history.end_txn();
+
+        self.after_edit(self.text.cursor.y);
+        self.selection_clear();
+    }
+
+    fn select_all(&mut self) {
+        let last = self.text.lines.len().saturating_sub(1);
+        self.selection.anchor = Cursor { x: 0, y: 0 };
+        self.text.cursor = Cursor {
+            x: self.text.lines[last].len(),
+            y: last,
+        };
+        self.selection.mode = SelectionMode::Line;
+        self.after_move();
+    }
+
+    /// The text to copy or cut: the selection when active, else the current line
+    /// with its trailing newline.
+    fn current_selection_or_line(&self) -> String {
+        if self.selection.is_active() {
+            self.text.selected_text(&self.selection)
+        } else {
+            let line = &self.text.lines[self.text.cursor.y];
+            let mut s = line.clone();
+            s.push('\n');
+            s
+        }
+    }
+
+    /// Refreshes the selection overlay for the visible rows and hands it to the
+    /// highlight stack. The spans themselves are computed by [`overlay`].
+    fn recompute_selection_overlay(&mut self) {
+        overlay::rebuild(
+            &self.text.lines,
+            &self.selection,
+            self.text.cursor,
+            self.viewport_state.scroll_y,
+            self.viewport_state.height,
+            &mut self.selection_rows,
+        );
+
+        self.viewport_state
+            .highlights
+            .replace_layer(LayerId::Overlay, &self.selection_rows);
+        self.viewport_state.highlights.set_enabled(true);
     }
 
     fn sync(&mut self) {
@@ -342,11 +652,17 @@ impl Default for EditorState {
             text: TextState::default(),
             path: None,
             dirty: false,
+            version: 0,
             viewport_state: ViewportState::default(),
             scrollbar_state: ScrollbarState::default(),
             h_scrollbar_state: ScrollbarState::default(),
             cursor_screen_pos: None,
+            selection: Selection::default(),
+            clipboard: Clipboard::new(ClipboardBackendKind::Auto, Box::new(std::io::stdout())),
+            selection_dirty: false,
+            selection_rows: Vec::new(),
             actions: Actions::new(),
+            history: History::new(),
         }
     }
 }
@@ -369,383 +685,4 @@ fn cursor_screen_pos(area: Rect, state: &EditorState) -> Position {
             relative_x as i32 + content_offset_x as i32,
             relative_y as i32,
         )
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::{Editor, EditorState};
-    use crate::Cursor;
-    use crate::component::Component;
-
-    use crossterm::event::{KeyCode, KeyModifiers};
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-    use ratatui::style::{Color, Modifier};
-
-    fn run(keys: &[KeyCode], state: &mut EditorState) {
-        for code in keys {
-            state.handle_key(*code, KeyModifiers::NONE);
-        }
-    }
-
-    /// Renders into a 20x5 area: 2 columns for the vertical scrollbar, 6 for
-    /// the line-number gutter and 12 visible text columns.
-    fn render(state: &mut EditorState) -> Buffer {
-        render_in(state, 20, 5)
-    }
-
-    /// Renders into an arbitrary area, e.g. wide enough for the scratch hint.
-    fn render_in(state: &mut EditorState, width: u16, height: u16) -> Buffer {
-        let area = Rect::new(0, 0, width, height);
-        let mut buf = Buffer::empty(area);
-        Component::render(Editor, area, &mut buf, state);
-        buf
-    }
-
-    /// The buffer's rows joined by newlines, for substring checks.
-    fn text_of(buf: &Buffer) -> String {
-        let area = buf.area();
-
-        (0..area.height)
-            .map(|y| {
-                (0..area.width)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn starts_with_a_single_empty_line() {
-        let state = EditorState::new();
-        assert_eq!(state.text.lines, vec![String::new()]);
-        assert_eq!((state.text.cursor.x, state.text.cursor.y), (0, 0));
-    }
-
-    #[test]
-    fn an_empty_scratch_buffer_shows_the_vim_style_welcome() {
-        let mut state = EditorState::new();
-
-        let buf = render_in(&mut state, 64, 12);
-
-        let text = text_of(&buf);
-        assert!(text.contains(env!("CARGO_PKG_NAME")));
-        assert!(text.contains(concat!("version ", env!("CARGO_PKG_VERSION"))));
-        assert!(text.contains("open file"));
-        assert!(text.contains("toggle file tree"));
-        assert!(text.contains("quit"));
-
-        // Centered block: title bright and bold at the top, hints dim, like
-        // the file tree's placeholder.
-        assert_eq!(buf[(16, 1)].symbol(), "i");
-        assert_eq!(buf[(16, 1)].fg, Color::White);
-        assert!(buf[(16, 1)].modifier.contains(Modifier::BOLD));
-        assert_eq!(buf[(16, 4)].symbol(), "C");
-        assert_eq!(buf[(16, 4)].fg, Color::DarkGray);
-        // The last hint keeps its own row and the dim style, so every welcome
-        // line is drawn, not only the first few.
-        assert_eq!(buf[(16, 10)].symbol(), "E");
-        assert_eq!(buf[(16, 10)].fg, Color::DarkGray);
-    }
-
-    #[test]
-    fn the_welcome_leaves_once_something_is_typed() {
-        let mut state = EditorState::new();
-        run(&[KeyCode::Char('x')], &mut state);
-
-        let buf = render_in(&mut state, 64, 12);
-
-        assert!(!text_of(&buf).contains("i-edit"));
-    }
-
-    #[test]
-    fn a_named_empty_buffer_shows_no_welcome() {
-        let mut state = EditorState::new();
-        state.load_file(PathBuf::from("empty.txt"), vec![String::new()]);
-
-        let buf = render_in(&mut state, 64, 12);
-
-        assert!(!text_of(&buf).contains("open file"));
-    }
-
-    #[test]
-    fn a_small_editor_drops_the_welcome_instead_of_clipping_it() {
-        let mut state = EditorState::new();
-
-        let buf = render(&mut state);
-
-        assert!(!text_of(&buf).contains("i-edit"));
-    }
-
-    #[test]
-    fn typing_appends_to_the_current_line() {
-        let mut state = EditorState::new();
-        run(&[KeyCode::Char('a'), KeyCode::Char('b')], &mut state);
-
-        assert_eq!(state.text.lines, vec![String::from("ab")]);
-        assert_eq!(state.text.cursor.x, 2);
-    }
-
-    #[test]
-    fn enter_splits_the_line_at_the_cursor() {
-        let mut state = EditorState::new();
-        run(
-            &[
-                KeyCode::Char('a'),
-                KeyCode::Char('b'),
-                KeyCode::Left,
-                KeyCode::Enter,
-            ],
-            &mut state,
-        );
-
-        assert_eq!(state.text.lines, vec![String::from("a"), String::from("b")]);
-        assert_eq!((state.text.cursor.x, state.text.cursor.y), (0, 1));
-    }
-
-    #[test]
-    fn backspace_at_line_start_joins_lines() {
-        let mut state = EditorState::new();
-        run(
-            &[
-                KeyCode::Char('a'),
-                KeyCode::Enter,
-                KeyCode::Char('b'),
-                KeyCode::Backspace,
-                KeyCode::Backspace,
-            ],
-            &mut state,
-        );
-
-        assert_eq!(state.text.lines, vec![String::from("a")]);
-        assert_eq!(state.text.cursor.x, 1);
-    }
-
-    #[test]
-    fn wide_chars_keep_the_cursor_on_char_boundaries() {
-        let mut state = EditorState::new();
-        run(
-            &[KeyCode::Char('你'), KeyCode::Left, KeyCode::Delete],
-            &mut state,
-        );
-
-        assert_eq!(state.text.lines, vec![String::new()]);
-        assert_eq!(state.text.cursor.x, 0);
-    }
-
-    #[test]
-    fn vertical_movement_keeps_the_display_column() {
-        let mut state = EditorState::new();
-        state.text.lines = vec![String::from("你好ab"), String::from("x")];
-        // End of "你好ab": byte 8, display column 6.
-        state.text.cursor = Cursor { x: 8, y: 0 };
-
-        run(&[KeyCode::Down], &mut state);
-
-        // Column 6 does not exist on "x", so the cursor stops at its end.
-        assert_eq!((state.text.cursor.x, state.text.cursor.y), (1, 1));
-    }
-
-    #[test]
-    fn paging_stays_safe_on_shorter_lines() {
-        let mut state = EditorState::new();
-        state.text.lines = (0..25)
-            .map(|i| {
-                if i == 0 {
-                    "a".repeat(30)
-                } else {
-                    String::from("xy")
-                }
-            })
-            .collect();
-        state.text.cursor = Cursor { x: 30, y: 0 };
-
-        run(&[KeyCode::PageDown], &mut state);
-        assert_eq!((state.text.cursor.x, state.text.cursor.y), (2, 20));
-
-        run(&[KeyCode::PageUp], &mut state);
-        assert_eq!((state.text.cursor.x, state.text.cursor.y), (2, 0));
-    }
-
-    #[test]
-    fn typing_past_the_right_edge_scrolls_the_view() {
-        let mut state = EditorState::new();
-        state.text.lines = vec!["a".repeat(40)];
-        state.viewport_state.width = 10;
-        state.text.cursor = Cursor { x: 9, y: 0 };
-
-        run(&[KeyCode::Right], &mut state);
-
-        // Column 10 no longer fits in 10 columns starting at 0.
-        assert_eq!(state.text.cursor.x, 10);
-        assert_eq!(state.viewport_state.scroll_x, 1);
-
-        run(&[KeyCode::Home], &mut state);
-
-        assert_eq!(state.viewport_state.scroll_x, 0);
-    }
-
-    #[test]
-    fn cursor_screen_pos_accounts_for_horizontal_scroll() {
-        let mut state = EditorState::new();
-        state.text.lines = vec!["a".repeat(40)];
-        state.viewport_state.scroll_x = 5;
-        state.text.cursor = Cursor { x: 8, y: 0 };
-
-        let pos = super::cursor_screen_pos(Rect::new(0, 0, 30, 5), &state);
-
-        // Gutter width 6, plus display column 8 shifted left by 5.
-        assert_eq!((pos.x, pos.y), (9, 0));
-    }
-
-    #[test]
-    fn an_overflowing_line_gets_a_horizontal_scrollbar() {
-        let mut state = EditorState::new();
-        state.text.lines = vec!["a".repeat(40)];
-
-        let buf = render(&mut state);
-
-        // The bar sits on the bottom row, aligned with the 12 text columns.
-        assert_eq!(buf[(6, 4)].symbol(), "◄");
-        assert_eq!(buf[(7, 4)].symbol(), "▬");
-        assert_eq!(buf[(16, 4)].symbol(), "─");
-        assert_eq!(buf[(17, 4)].symbol(), "►");
-        // The reserved row shrinks the viewport, not the text itself.
-        assert_eq!(state.viewport_state.height, 4);
-        assert_eq!(buf[(6, 0)].symbol(), "a");
-    }
-
-    #[test]
-    fn short_lines_keep_the_bottom_row_for_text() {
-        let mut state = EditorState::new();
-        state.text.lines = (0..5).map(|i| format!("line {i}")).collect();
-
-        let buf = render(&mut state);
-
-        assert_eq!(state.viewport_state.height, 5);
-        assert_eq!(buf[(6, 4)].symbol(), "l");
-    }
-
-    #[test]
-    fn the_cursor_line_number_is_highlighted() {
-        let mut state = EditorState::new();
-        state.text.lines = vec![String::from("a"), String::from("b")];
-        state.text.cursor = Cursor { x: 0, y: 1 };
-
-        let buf = render(&mut state);
-
-        assert_eq!(buf[(2, 0)].fg, Color::DarkGray);
-        assert_eq!(buf[(2, 1)].fg, Color::White);
-    }
-
-    #[test]
-    fn the_thumb_follows_the_horizontal_scroll() {
-        let mut state = EditorState::new();
-        state.text.lines = vec!["a".repeat(40)];
-        state.viewport_state.scroll_x = 12;
-
-        let buf = render(&mut state);
-
-        assert_eq!(state.h_scrollbar_state.get_position(), 12);
-        assert_eq!(buf[(7, 4)].symbol(), "─");
-        assert_eq!(buf[(10, 4)].symbol(), "▬");
-    }
-
-    #[test]
-    fn rendering_pulls_a_stale_horizontal_offset_back() {
-        let mut state = EditorState::new();
-        state.text.lines = vec!["a".repeat(8)];
-        state.viewport_state.scroll_x = 5;
-
-        render(&mut state);
-
-        // Eight columns fit in twelve; nothing should stay scrolled off.
-        assert_eq!(state.viewport_state.scroll_x, 0);
-    }
-
-    #[test]
-    fn load_file_sets_the_path_and_resets_the_view() {
-        let mut state = EditorState::new();
-        state.dirty = true;
-        state.viewport_state.scroll_x = 3;
-        state.viewport_state.scroll_y = 2;
-        state.viewport_state.curr_line = 1;
-        state.scrollbar_state = state.scrollbar_state.position(4);
-        state.h_scrollbar_state = state.h_scrollbar_state.position(5);
-        state.cursor_screen_pos = Some(ratatui::layout::Position::new(1, 1));
-
-        let path = PathBuf::from("notes.txt");
-        state.load_file(path.clone(), vec![String::from("one"), String::from("two")]);
-
-        assert_eq!(state.path, Some(path));
-        assert!(!state.dirty);
-        assert_eq!(
-            state.text.lines,
-            vec![String::from("one"), String::from("two")]
-        );
-        assert_eq!(state.viewport_state.scroll_x, 0);
-        assert_eq!(state.viewport_state.scroll_y, 0);
-        assert_eq!(state.viewport_state.curr_line, 0);
-        assert_eq!(state.scrollbar_state.get_position(), 0);
-        assert_eq!(state.h_scrollbar_state.get_position(), 0);
-        assert_eq!(state.cursor_screen_pos, None);
-    }
-
-    #[test]
-    fn typing_marks_the_buffer_dirty() {
-        let mut state = EditorState::new();
-        assert!(!state.dirty);
-
-        run(&[KeyCode::Char('a')], &mut state);
-
-        assert!(state.dirty);
-    }
-
-    #[test]
-    fn deleting_and_enter_also_mark_the_buffer_dirty() {
-        let cases = [
-            vec![KeyCode::Char('a'), KeyCode::Backspace],
-            vec![KeyCode::Char('a'), KeyCode::Left, KeyCode::Delete],
-            vec![KeyCode::Char('a'), KeyCode::Enter],
-        ];
-
-        for keys in cases {
-            let mut state = EditorState::new();
-            run(&keys, &mut state);
-            assert!(state.dirty, "{keys:?} should have marked the buffer dirty");
-        }
-    }
-
-    #[test]
-    fn movement_does_not_mark_the_buffer_dirty() {
-        let mut state = EditorState::new();
-        run(
-            &[
-                KeyCode::Left,
-                KeyCode::Right,
-                KeyCode::Up,
-                KeyCode::Down,
-                KeyCode::Home,
-                KeyCode::End,
-                KeyCode::PageUp,
-                KeyCode::PageDown,
-            ],
-            &mut state,
-        );
-
-        assert!(!state.dirty);
-    }
-
-    #[test]
-    fn mark_saved_clears_the_dirty_flag() {
-        let mut state = EditorState::new();
-        run(&[KeyCode::Char('a')], &mut state);
-
-        state.mark_saved();
-
-        assert!(!state.dirty);
-    }
 }

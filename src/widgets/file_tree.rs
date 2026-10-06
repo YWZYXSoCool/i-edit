@@ -68,9 +68,15 @@ pub struct FileTreeState {
     rows: Vec<Row>,
     /// Index into the flattened rows.
     selected: usize,
+    /// Whether the shell's keyboard focus is on the tree. Only a focused tree
+    /// highlights the selected row.
+    focused: bool,
     /// First row of the flattened list shown; fixed up at render time, when
     /// the available height is known.
     scroll: usize,
+    /// Expansion changes since the last drain. Components cannot touch
+    /// storage, so the shell picks these up and persists them.
+    expansion_changes: Vec<(PathBuf, bool)>,
     actions: Actions,
 }
 
@@ -96,6 +102,15 @@ impl FileTreeState {
         self.root.as_deref()
     }
 
+    /// Sets whether the shell's keyboard focus is on the tree.
+    ///
+    /// Leaving the tree keeps its selection index, but stops highlighting the
+    /// row: the highlight marks where the next key would act, so it goes away
+    /// with the keys while the index is remembered for the way back.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
     /// Takes everything this component has asked for since the last drain.
     pub fn take_actions(&mut self) -> Vec<Action> {
         self.actions.drain()
@@ -106,9 +121,27 @@ impl FileTreeState {
         self.actions.take_into(out)
     }
 
+    /// Moves the directories expanded or collapsed since the last call onto
+    /// `out`, so the shell can remember them across runs.
+    pub fn take_expansion_changes_into(&mut self, out: &mut Vec<(PathBuf, bool)>) {
+        out.append(&mut self.expansion_changes);
+    }
+
     /// The flattened rows as of the last structural change.
     pub(crate) fn rows(&self) -> &[Row] {
         &self.rows
+    }
+
+    /// The selected row index, for the shell's tests.
+    #[cfg(test)]
+    pub(crate) fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    /// Whether the tree renders as focused, for the shell's tests.
+    #[cfg(test)]
+    pub(crate) fn is_focused(&self) -> bool {
+        self.focused
     }
 
     /// Moves the selection by `delta` rows, clamped to the ends.
@@ -219,7 +252,9 @@ impl FileTreeState {
     /// through a collapse. Collapsing a directory with no cache entry does
     /// nothing; the rows are rebuilt either way, because the caller may be
     /// reacting to a tree that changed elsewhere.
-    fn set_expanded(&mut self, path: &Path, expanded: bool) {
+    /// Public so the shell can rebuild last run's expansion from storage;
+    /// every call is reported through [`Self::take_expansion_changes_into`].
+    pub fn set_expanded(&mut self, path: &Path, expanded: bool) {
         if expanded {
             let dir = self.dirs.entry(path.to_path_buf()).or_insert_with(|| Dir {
                 children: None,
@@ -233,6 +268,7 @@ impl FileTreeState {
             dir.expanded = false;
         }
 
+        self.expansion_changes.push((path.to_path_buf(), expanded));
         self.rebuild_rows();
     }
 
@@ -379,7 +415,8 @@ impl Component for FileTree {
                 width: inner.width,
                 height: 1,
             };
-            render_row(row, row_area, state.selected == state.scroll + offset, buf);
+            let selected = state.focused && state.selected == state.scroll + offset;
+            render_row(row, row_area, selected, buf);
         }
 
         if hint_height == 1 {
@@ -423,8 +460,8 @@ fn render_row(row: &Row, area: Rect, selected: bool, buf: &mut Buffer) {
     } else {
         icon::CHEVRON
     };
-    let folder = if !row.is_dir {
-        icon::FILE
+    let icon = if !row.is_dir {
+        icon::icon_for(&row.name)
     } else if row.expanded {
         icon::FOLDER_OPEN
     } else {
@@ -448,7 +485,8 @@ fn render_row(row: &Row, area: Rect, selected: bool, buf: &mut Buffer) {
     };
     Line::from(vec![
         Span::styled(marker, style),
-        Span::styled(folder, style),
+        Span::styled(" ", style),
+        Span::styled(icon, style),
         Span::styled(" ", style),
         Span::styled(row.name.as_str(), style),
     ])
@@ -462,410 +500,4 @@ fn root_name(root: &Path) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| root.display().to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{FileTree, FileTreeState};
-    use crate::action::Action;
-    use crate::component::Component;
-    use crate::icon;
-
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-    use ratatui::style::Color;
-
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A unique directory that deletes itself, so tests can run in parallel and
-    /// leave nothing behind even when they panic.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let unique = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "i-edit-tree-test-{}-{}",
-                std::process::id(),
-                unique
-            ));
-
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn press(code: KeyCode) -> Event {
-        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
-    }
-
-    fn keys(state: &mut FileTreeState, codes: &[KeyCode]) {
-        for &code in codes {
-            Component::handle_event(FileTree, &press(code), state);
-        }
-    }
-
-    fn row_names(state: &FileTreeState) -> Vec<String> {
-        state.rows().iter().map(|row| row.name.clone()).collect()
-    }
-
-    /// Root with two directories, a hidden file and a regular file; `src`
-    /// holds two files of its own.
-    fn fixture() -> TempDir {
-        let dir = TempDir::new();
-        fs::create_dir(dir.path().join("docs")).unwrap();
-        fs::create_dir(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join(".hidden"), "secret").unwrap();
-        fs::write(dir.path().join("readme.md"), "# readme").unwrap();
-        fs::write(dir.path().join("src").join("app.rs"), "// app").unwrap();
-        fs::write(dir.path().join("src").join("main.rs"), "fn main() {}").unwrap();
-        dir
-    }
-
-    fn open_fixture() -> (TempDir, FileTreeState) {
-        let dir = fixture();
-        let mut state = FileTreeState::new();
-        state.open_root(dir.path().to_path_buf());
-        (dir, state)
-    }
-
-    fn root_name(dir: &TempDir) -> String {
-        dir.path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    #[test]
-    fn a_fresh_state_has_no_root_and_renders_the_placeholder() {
-        let mut state = FileTreeState::new();
-        assert!(state.root().is_none());
-
-        let area = Rect::new(0, 0, 40, 3);
-        let mut buf = Buffer::empty(area);
-        Component::render(FileTree, area, &mut buf, &mut state);
-
-        let row: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
-        assert_eq!(row.trim_end(), "no folder opened · Ctrl+Shift+O");
-        assert_eq!(buf[(0, 0)].style().fg, Some(Color::DarkGray));
-        assert_eq!(buf[(0, 1)].symbol(), " ");
-    }
-
-    #[test]
-    fn open_root_shows_the_root_and_its_children_dirs_first() {
-        let (dir, state) = open_fixture();
-
-        assert_eq!(state.root(), Some(dir.path()));
-
-        let root = root_name(&dir);
-        assert_eq!(
-            row_names(&state),
-            [root.as_str(), "docs", "src", ".hidden", "readme.md"]
-        );
-
-        let rows = state.rows();
-        assert!(rows[0].is_dir && rows[0].expanded);
-        // Nothing below the root has been read yet.
-        assert!(!state.dirs.contains_key(&dir.path().join("src")));
-    }
-
-    #[test]
-    fn right_expands_a_directory_and_loads_its_children() {
-        let (dir, mut state) = open_fixture();
-        assert!(!state.dirs.contains_key(&dir.path().join("src")));
-
-        keys(&mut state, &[KeyCode::Down, KeyCode::Down]); // root -> docs -> src
-        keys(&mut state, &[KeyCode::Right]);
-
-        assert!(state.dirs.contains_key(&dir.path().join("src")));
-        assert_eq!(state.selected, 2, "expanding does not move the selection");
-
-        let root = root_name(&dir);
-        assert_eq!(
-            row_names(&state),
-            [
-                root.as_str(),
-                "docs",
-                "src",
-                "app.rs",
-                "main.rs",
-                ".hidden",
-                "readme.md"
-            ]
-        );
-    }
-
-    #[test]
-    fn right_on_an_expanded_directory_steps_into_the_first_child() {
-        let (_dir, mut state) = open_fixture();
-
-        keys(&mut state, &[KeyCode::Down, KeyCode::Down, KeyCode::Right]); // expand src
-        keys(&mut state, &[KeyCode::Right]); // step into app.rs
-        assert_eq!(state.rows()[state.selected].name, "app.rs");
-
-        keys(&mut state, &[KeyCode::Down, KeyCode::Right]); // main.rs; Right on a file does nothing
-        assert_eq!(state.rows()[state.selected].name, "main.rs");
-        assert_eq!(state.rows().len(), 7);
-    }
-
-    #[test]
-    fn left_collapses_an_expanded_directory_then_jumps_to_its_parent() {
-        let (dir, mut state) = open_fixture();
-
-        keys(
-            &mut state,
-            &[KeyCode::Down, KeyCode::Down, KeyCode::Right, KeyCode::Right],
-        ); // src expanded, app.rs selected
-        keys(&mut state, &[KeyCode::Left]); // back to src
-        assert_eq!(state.selected, 2);
-        assert!(
-            state
-                .dirs
-                .get(&dir.path().join("src"))
-                .is_some_and(|d| d.expanded)
-        );
-
-        keys(&mut state, &[KeyCode::Left]); // collapse src
-        assert!(
-            !state
-                .dirs
-                .get(&dir.path().join("src"))
-                .is_some_and(|d| d.expanded)
-        );
-        assert_eq!(state.selected, 2);
-        assert_eq!(row_names(&state).len(), 5);
-
-        keys(&mut state, &[KeyCode::Left]); // src -> root
-        assert_eq!(state.selected, 0);
-
-        keys(&mut state, &[KeyCode::Left]); // root is expanded: collapse it
-        assert_eq!(row_names(&state).len(), 1);
-
-        keys(&mut state, &[KeyCode::Left]); // collapsed root has no parent
-        assert_eq!(state.selected, 0);
-        assert_eq!(row_names(&state).len(), 1);
-    }
-
-    #[test]
-    fn enter_on_a_file_requests_loading_it() {
-        let (dir, mut state) = open_fixture();
-
-        keys(
-            &mut state,
-            &[KeyCode::Down, KeyCode::Down, KeyCode::Right, KeyCode::Down],
-        ); // app.rs
-        keys(&mut state, &[KeyCode::Enter]);
-
-        let expected = dir.path().join("src").join("app.rs");
-        assert_eq!(state.take_actions(), vec![Action::LoadFile(expected)]);
-        assert!(state.take_actions().is_empty());
-    }
-
-    #[test]
-    fn enter_on_a_directory_toggles_it() {
-        let (_dir, mut state) = open_fixture();
-
-        keys(&mut state, &[KeyCode::Down, KeyCode::Down]); // src
-        keys(&mut state, &[KeyCode::Enter]);
-        assert_eq!(row_names(&state).len(), 7);
-        assert_eq!(state.selected, 2);
-
-        keys(&mut state, &[KeyCode::Enter]);
-        assert_eq!(row_names(&state).len(), 5);
-        assert_eq!(state.selected, 2);
-    }
-
-    #[test]
-    fn hidden_entries_are_listed_and_rendered_dim() {
-        let (_dir, mut state) = open_fixture();
-        assert!(row_names(&state).contains(&".hidden".to_string()));
-
-        let area = Rect::new(0, 0, 24, 7);
-        let mut buf = Buffer::empty(area);
-        Component::render(FileTree, area, &mut buf, &mut state);
-
-        // `.hidden` is the fourth row, one level deep: after the border, two
-        // indent columns and the marker column, the file icon sits at column 4.
-        assert_eq!(buf[(4, 3)].symbol(), icon::FILE);
-        assert_eq!(buf[(4, 3)].style().fg, Some(Color::DarkGray));
-        // A regular file keeps the terminal's own colours.
-        assert_eq!(buf[(4, 4)].symbol(), icon::FILE);
-        assert_ne!(buf[(4, 4)].style().fg, Some(Color::DarkGray));
-
-        // Selecting it inverts the whole row, dimness included.
-        keys(&mut state, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
-        assert_eq!(state.rows()[state.selected].name, ".hidden");
-
-        let mut buf = Buffer::empty(area);
-        Component::render(FileTree, area, &mut buf, &mut state);
-
-        assert_eq!(buf[(4, 3)].style().fg, Some(Color::Black));
-        assert_eq!(buf[(4, 3)].style().bg, Some(Color::White));
-        assert_eq!(buf[(area.width - 1, 3)].style().bg, Some(Color::White));
-        // The separator stays outside the highlight.
-        assert_eq!(buf[(0, 3)].style().fg, Some(Color::DarkGray));
-        assert_ne!(buf[(0, 3)].style().bg, Some(Color::White));
-    }
-
-    #[test]
-    fn selection_stays_clamped_after_collapsing() {
-        let (_dir, mut state) = open_fixture();
-
-        keys(&mut state, &[KeyCode::Down, KeyCode::Down, KeyCode::Right]); // expand src
-        keys(&mut state, &[KeyCode::Down]); // step into app.rs
-        assert_eq!(state.rows()[state.selected].name, "app.rs");
-
-        keys(&mut state, &[KeyCode::Left]); // app.rs -> src
-        assert_eq!(state.selected, 2);
-        keys(&mut state, &[KeyCode::Left]); // collapse src
-        assert_eq!(state.selected, 2);
-        assert_eq!(state.rows().len(), 5);
-
-        // The ends clamp rather than run past the shorter list.
-        keys(
-            &mut state,
-            &[KeyCode::Up, KeyCode::Up, KeyCode::Up, KeyCode::Up],
-        );
-        assert_eq!(state.selected, 0);
-        keys(&mut state, &[KeyCode::Down; 9]);
-        assert_eq!(state.selected, state.rows().len() - 1);
-    }
-
-    #[test]
-    fn collapsing_an_ancestor_under_the_selection_clamps_on_the_next_key() {
-        let (dir, mut state) = open_fixture();
-
-        keys(
-            &mut state,
-            &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down],
-        ); // readme.md, the last row
-        assert_eq!(state.selected, 4);
-
-        // Only an external refresh could collapse an ancestor without moving
-        // the selection first; the key handlers must still cope with the stale
-        // index.
-        state.set_expanded(dir.path(), false);
-        keys(&mut state, &[KeyCode::Up]);
-
-        assert_eq!(state.selected, 0);
-        assert_eq!(row_names(&state).len(), 1);
-    }
-
-    #[test]
-    fn rendering_into_a_tiny_buffer_does_not_panic() {
-        let (_dir, mut state) = open_fixture();
-
-        for (width, height) in [(0, 0), (1, 1), (1, 2), (2, 2), (3, 3), (4, 10), (10, 4)] {
-            let area = Rect::new(0, 0, width, height);
-            let mut buf = Buffer::empty(area);
-            Component::render(FileTree, area, &mut buf, &mut state);
-        }
-
-        let mut fresh = FileTreeState::new();
-        for (width, height) in [(0, 0), (2, 1)] {
-            let area = Rect::new(0, 0, width, height);
-            let mut buf = Buffer::empty(area);
-            Component::render(FileTree, area, &mut buf, &mut fresh);
-        }
-    }
-
-    #[test]
-    fn the_root_path_hint_takes_the_bottom_row_when_there_is_room() {
-        let (dir, mut state) = open_fixture();
-
-        // Exactly as wide as the path, so the clipped hint can be compared
-        // without trailing blanks.
-        let displayed = dir.path().display().to_string();
-        let width = (displayed.chars().count() as u16 + 1).min(500);
-        let area = Rect::new(0, 0, width, 4);
-        let mut buf = Buffer::empty(area);
-        Component::render(FileTree, area, &mut buf, &mut state);
-
-        let hint: String = (1..area.width)
-            .map(|x| buf[(x, area.height - 1)].symbol())
-            .collect();
-        let expected: String = displayed.chars().take(width as usize - 1).collect();
-        assert_eq!(hint, expected);
-        assert_eq!(buf[(1, area.height - 1)].style().fg, Some(Color::DarkGray));
-
-        // A two-row panel is too short: both rows stay with the entries.
-        let short = Rect::new(0, 0, 40, 2);
-        let mut buf = Buffer::empty(short);
-        Component::render(FileTree, short, &mut buf, &mut state);
-        assert_eq!(buf[(3, 1)].symbol(), icon::CHEVRON); // docs, collapsed
-    }
-
-    #[test]
-    fn open_root_resets_the_previous_tree() {
-        let (first, mut state) = open_fixture();
-        let first_src = first.path().join("src");
-
-        keys(
-            &mut state,
-            &[KeyCode::Down, KeyCode::Down, KeyCode::Right, KeyCode::Down],
-        ); // expand src, select app.rs
-        state.scroll = 2;
-        assert_eq!(state.selected, 3);
-        assert!(state.dirs.contains_key(&first_src));
-
-        let second = TempDir::new();
-        state.open_root(second.path().to_path_buf());
-
-        assert_eq!(state.selected, 0);
-        assert_eq!(state.scroll, 0);
-        assert!(!state.dirs.contains_key(&first_src));
-        assert_eq!(state.dirs.len(), 1);
-        assert_eq!(state.dirs.values().filter(|dir| dir.expanded).count(), 1);
-        assert!(
-            state
-                .dirs
-                .get(second.path())
-                .is_some_and(|dir| dir.expanded)
-        );
-        assert_eq!(state.rows().len(), 1);
-    }
-
-    #[test]
-    fn a_root_that_cannot_be_read_still_shows_its_own_row() {
-        let dir = TempDir::new();
-        let missing = dir.path().join("missing");
-
-        let mut state = FileTreeState::new();
-        state.open_root(missing.clone());
-
-        assert_eq!(state.root(), Some(missing.as_path()));
-        let rows = state.rows();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].is_dir && rows[0].expanded);
-    }
-
-    #[test]
-    fn keys_that_are_not_bound_are_ignored() {
-        let (_dir, mut state) = open_fixture();
-
-        keys(
-            &mut state,
-            &[KeyCode::Esc, KeyCode::Char('x'), KeyCode::PageDown],
-        );
-
-        assert_eq!(state.selected, 0);
-        assert_eq!(state.rows().len(), 5);
-        assert!(state.take_actions().is_empty());
-    }
 }

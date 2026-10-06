@@ -78,9 +78,15 @@ impl InputState {
     /// means) and Up/Down collapse to the ends of the line.
     pub fn input(&mut self, ev: KeyEvent) {
         match ev.code {
-            KeyCode::Char(c) => self.text.insert_char(c),
-            KeyCode::Backspace => self.text.delete_backward(),
-            KeyCode::Delete => self.text.delete_forward(),
+            KeyCode::Char(c) => {
+                self.text.insert_char(c);
+            }
+            KeyCode::Backspace => {
+                self.text.delete_backward();
+            }
+            KeyCode::Delete => {
+                self.text.delete_forward();
+            }
             KeyCode::Up | KeyCode::Home => self.text.move_to_text_start(),
             KeyCode::Down | KeyCode::End => self.text.move_to_text_end(),
             KeyCode::Left => self.text.move_left(),
@@ -111,9 +117,9 @@ impl<'a> Input<'a> {
             placeholder: None,
             max_length: usize::MAX,
             password_mode: false,
-            style: Style::default().fg(Color::White),
-            focus_style: Style::default().fg(Color::Yellow),
-            cursor_style: Style::default().bg(Color::LightYellow).fg(Color::Black),
+            style: Style::default().fg(Color::Gray),
+            focus_style: Style::default().fg(Color::White),
+            cursor_style: Style::default().bg(Color::White).fg(Color::Black),
         }
     }
 

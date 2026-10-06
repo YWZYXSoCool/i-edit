@@ -43,3 +43,18 @@ pub(crate) fn key_press(event: &crossterm::event::Event) -> Option<crossterm::ev
         _ => None,
     }
 }
+
+#[macro_export]
+macro_rules! map {
+    () => {
+        std::collections::HashMap::new()
+    };
+
+    ($($key: expr => $value: expr),+ $(,)?) => {
+        {
+            let mut map = std::collections::HashMap::new();
+            $(map.insert($key, $value);)+
+            map
+        }
+    };
+}

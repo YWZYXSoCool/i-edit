@@ -7,7 +7,13 @@ edition = "2024"
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
 log = "0.4.34"
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", features = ["underline-color"] }
 thiserror = "2.0.21"
 tui-logger = { version = "0.18.3", features = ["crossterm"] }
 unicode-width = "0.2.2"
+base64 = "0.22"
+arboard = { version = "3", optional = true }
+
+[features]
+default = ["system-clipboard"]
+system-clipboard = ["dep:arboard"]

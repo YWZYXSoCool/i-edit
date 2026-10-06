@@ -203,7 +203,7 @@ pub fn expand_path(input: &str) -> PathBuf {
 
 /// `HOME` first so Unix shells and Git Bash work the same way; `USERPROFILE`
 /// covers plain Windows environments where `HOME` is unset.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     ["HOME", "USERPROFILE"]
         .into_iter()
         .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()))

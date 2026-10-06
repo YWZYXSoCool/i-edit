@@ -1,10 +1,14 @@
 pub mod action;
 pub mod app;
+pub mod clipboard;
 pub mod component;
 pub mod error;
 pub mod fixed_buf;
 pub mod fs;
+pub mod highlight;
 pub mod icon;
+pub mod shortcuts;
+pub mod storage;
 pub mod text;
 pub mod utils;
 pub mod widgets;

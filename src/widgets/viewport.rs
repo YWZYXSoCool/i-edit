@@ -1,10 +1,12 @@
 use core::fmt::Write;
 
 use crate::fixed_buf::FixedBuf;
+use crate::highlight::{Highlights, StyledRun};
 use crate::utils;
 
 use ratatui::style::{Color, Style};
 use ratatui::widgets::StatefulWidget;
+use unicode_width::UnicodeWidthChar;
 
 pub const LINE_NUMBER_MIN_WIDTH: usize = 3;
 pub const LINE_NUMBER_SUFFIX: &str = " | ";
@@ -29,6 +31,12 @@ pub struct ViewportState {
     /// during render; until then horizontal scrolling stays put.
     pub width: usize,
     pub height: usize,
+
+    /// Per-row coloring. Owned here so the renderer can read it during
+    /// `render` through the `&mut ViewportState` it already holds, with no new
+    /// borrow. Off by default, so the editor behaves exactly as before until a
+    /// producer feeds it data.
+    pub highlights: Highlights,
 }
 
 pub struct Viewport<'a> {
@@ -99,34 +107,152 @@ impl StatefulWidget for Viewport<'_> {
                     .set_style(style);
             }
 
-            // Column offsets are relative to the text start and shifted left by
-            // `scroll_x`. A wide char cut by either edge is dropped instead of
-            // half-drawn, leaving its cells blank.
+            // Coloring is pulled per row. When it is off we hand the renderer
+            // empty slices, so every text cell keeps the default style — the
+            // byte-for-byte output of the pre-coloring editor.
+            let empty: (&[StyledRun], &[StyledRun]) = (&[], &[]);
+            let (base, overlay) = if state.highlights.enabled() {
+                state.highlights.line_runs(absolute_y)
+            } else {
+                empty
+            };
+
+            // Two cursors walk the layers in lockstep with the characters. Each
+            // advances past runs it has moved beyond; `overlay` is consulted
+            // first, then `base`, then the default style. The cursors track byte
+            // positions, never display columns, so horizontal scrolling never
+            // shifts a color off its character.
+            let mut bi = 0usize;
+            let mut oi = 0usize;
             let mut col_offset = -(state.scroll_x as i32);
-            for ch in line.chars() {
-                let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as i32;
+            let mut last_drawn: Option<i32> = None;
+
+            for (byte_idx, ch) in line.char_indices() {
+                let char_width = UnicodeWidthChar::width(ch).unwrap_or(0) as i32;
+
+                while bi < base.len() && run_exhausted(&base[bi], byte_idx) {
+                    bi += 1;
+                }
+                while oi < overlay.len() && run_exhausted(&overlay[oi], byte_idx) {
+                    oi += 1;
+                }
+
+                // `overlay` wins, then `base`, then the default style.
+                let style = overlay
+                    .get(oi)
+                    .filter(|r| (r.start as usize) <= byte_idx)
+                    .or_else(|| base.get(bi).filter(|r| (r.start as usize) <= byte_idx))
+                    .map_or(Style::default(), |r| r.style);
 
                 if col_offset >= 0 && col_offset + char_width <= text_width {
                     let x = area.x + content_offset_x as u16 + col_offset as u16;
-                    buf[(x, area.y + relative_y as u16)].set_char(ch);
+                    let y = area.y + relative_y as u16;
+
+                    let is_whitespace = ch.is_whitespace();
+                    let written_char = if is_whitespace { '·' } else { ch };
+                    let style = if is_whitespace {
+                        style.fg(Color::DarkGray)
+                    } else {
+                        style
+                    };
+                    buf[(x, y)].set_char(written_char).set_style(style);
+
                     if char_width == 2 {
-                        buf[(x + 1, area.y + relative_y as u16)].set_char(' ');
+                        // A wide char's second cell must carry the same style,
+                        // or CJK comments/strings show a broken color block.
+                        buf[(x + 1, y)].set_char(' ').set_style(style);
                     }
+                    last_drawn = Some(x as i32 + char_width - 1);
                 }
 
                 col_offset += char_width;
+            }
+
+            // A run that reaches the line end (e.g. a current-line background or
+            // a diagnostic background) must keep painting to the visible row
+            // end, otherwise the highlight snaps off at the last character. Only
+            // rows whose trailing run carries a background are touched; plain
+            // text pays nothing.
+            if let Some(bg) = trailing_background(base, overlay, line.len()) {
+                let fill_from = match last_drawn {
+                    Some(end) => end + 1,
+                    // An empty row with a trailing (zero-length) background run
+                    // still gets the full highlight; a row scrolled entirely off
+                    // to the left is left alone.
+                    None if line.is_empty() => content_offset_x as i32,
+                    None => continue,
+                };
+                let fill_to = content_offset_x as i32 + text_width;
+                for x in fill_from..fill_to {
+                    if x < 0 {
+                        continue;
+                    }
+                    let x = x as u16;
+                    buf[(x, area.y + relative_y as u16)].set_style(bg);
+                }
             }
         }
     }
 }
 
+/// Whether `run` no longer covers `byte_idx`.
+///
+/// A normal run `[start, end)` covers `byte_idx` while `byte_idx < end`; once
+/// we reach `end` it is spent. A zero-length run `[p, p)` is a decoration at a
+/// single position (a diagnostic at a line end, say) and covers only the cell
+/// that starts exactly at `p` — so it is spent as soon as `byte_idx > p`. That
+/// keeps it from swallowing the following character.
+fn run_exhausted(run: &StyledRun, byte_idx: usize) -> bool {
+    let start = run.start as usize;
+    let end = run.end as usize;
+    if start == end {
+        byte_idx > start
+    } else {
+        byte_idx >= end
+    }
+}
+
+/// The style whose background should extend to the visible row end, if a run
+/// reaches the line end (`end == line_len`, or a zero-length run at `line_len`).
+/// `overlay` takes priority over `base`.
+fn trailing_background(
+    base: &[StyledRun],
+    overlay: &[StyledRun],
+    line_len: usize,
+) -> Option<Style> {
+    let candidate = |run: &StyledRun| -> Option<Style> {
+        let reaches_end = (run.end as usize) == line_len
+            || (run.start as usize) == (run.end as usize) && (run.start as usize) == line_len;
+        // `Style::bg` is `Option<Color>`; `None` is "no background", which means
+        // the run contributes no trailing fill.
+        if reaches_end && run.style.bg.is_some() {
+            Some(run.style)
+        } else {
+            None
+        }
+    };
+
+    for run in overlay.iter().rev() {
+        if let Some(style) = candidate(run) {
+            return Some(style);
+        }
+    }
+    for run in base.iter().rev() {
+        if let Some(style) = candidate(run) {
+            return Some(style);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Viewport, ViewportState};
+    use super::{StyledRun, Viewport, ViewportState, gutter_width};
+    use crate::highlight::LayerId;
 
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Style};
     use ratatui::widgets::StatefulWidget;
 
     fn render(lines: &[String], state: &mut ViewportState, width: u16) -> Buffer {
@@ -178,5 +304,137 @@ mod tests {
 
         assert_eq!(buf[(2, 0)].fg, Color::DarkGray);
         assert_eq!(buf[(2, 1)].fg, Color::White);
+    }
+
+    // --- Coloring (Phase 1) -------------------------------------------------
+
+    fn colored_state(rows: &[Vec<StyledRun>], enabled: bool) -> ViewportState {
+        let mut state = ViewportState::default();
+        state.highlights.replace_layer(LayerId::Overlay, rows);
+        state.highlights.set_enabled(enabled);
+        state
+    }
+
+    fn run_at(start: u32, end: u32, color: Color) -> StyledRun {
+        StyledRun {
+            start,
+            end,
+            style: Style::new().fg(color),
+        }
+    }
+
+    #[test]
+    fn overlay_paints_a_single_cell() {
+        // Line "abc": color bytes [0,1) (the 'a').
+        let lines = vec![String::from("abc")];
+        let mut state = colored_state(&[vec![run_at(0, 1, Color::Red)]], true);
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        assert_eq!(buf[(content, 0)].symbol(), "a");
+        assert_eq!(buf[(content, 0)].fg, Color::Red);
+        // The rest stays default.
+        assert_eq!(buf[(content + 1, 0)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn overlay_takes_priority_over_base() {
+        let lines = vec![String::from("abc")];
+        let mut state = ViewportState::default();
+        state
+            .highlights
+            .replace_layer(LayerId::Base, &[vec![run_at(0, 3, Color::Red)]]);
+        state
+            .highlights
+            .replace_layer(LayerId::Overlay, &[vec![run_at(0, 1, Color::Blue)]]);
+        state.highlights.set_enabled(true);
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        // Overlay covers byte [0,1) → Blue wins on 'a'.
+        assert_eq!(buf[(content, 0)].fg, Color::Blue);
+        // Base shows through where overlay does not → 'b' Red.
+        assert_eq!(buf[(content + 1, 0)].fg, Color::Red);
+    }
+
+    #[test]
+    fn scroll_x_keeps_color_locked_to_its_character() {
+        // 10-char line, color byte [3,4) ('d'); scroll 2 columns left.
+        let lines = vec![String::from("abcdefghij")];
+        let mut state = colored_state(&[vec![run_at(3, 4, Color::Red)]], true);
+        state.scroll_x = 2;
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        // 'd' (byte 3, display col 3) lands at visible display col 1.
+        assert_eq!(buf[(content + 1, 0)].symbol(), "d");
+        assert_eq!(buf[(content + 1, 0)].fg, Color::Red);
+        // 'c' (display col 2) is the first visible char, uncolored.
+        assert_eq!(buf[(content, 0)].symbol(), "c");
+        assert_eq!(buf[(content, 0)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn wide_char_second_cell_carries_the_same_style() {
+        // "你x": color byte [0,3) (the '你', width 2).
+        let lines = vec![String::from("你x")];
+        let mut state = colored_state(&[vec![run_at(0, 3, Color::Red)]], true);
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        // First cell of '你' and its trailing cell both red, else the block breaks.
+        assert_eq!(buf[(content, 0)].fg, Color::Red);
+        assert_eq!(buf[(content + 1, 0)].fg, Color::Red);
+        // 'x' (byte 3) is untouched.
+        assert_eq!(buf[(content + 2, 0)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn trailing_background_fills_to_the_row_end() {
+        // Full-line background on "abc".
+        let lines = vec![String::from("abc")];
+        let mut state = ViewportState::default();
+        state.highlights.replace_layer(
+            LayerId::Overlay,
+            &[vec![StyledRun {
+                start: 0,
+                end: 3,
+                style: Style::new().bg(Color::Blue),
+            }]],
+        );
+        state.highlights.set_enabled(true);
+        let buf = render(&lines, &mut state, 20);
+
+        let content = gutter_width(lines.len()) as u16;
+        // Every cell from the line start to the visible row end carries the bg.
+        for x in content..20 {
+            assert_eq!(buf[(x, 0)].bg, Color::Blue, "cell {x} missing bg");
+        }
+    }
+
+    #[test]
+    fn zero_length_run_colors_one_cell_without_swallowing_the_next() {
+        // A zero-length run at byte 1 (between 'a' and 'b') colors only 'b'.
+        let lines = vec![String::from("ab")];
+        let mut state = colored_state(&[vec![run_at(1, 1, Color::Blue)]], true);
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        assert_eq!(buf[(content, 0)].fg, Color::Reset); // 'a' untouched
+        assert_eq!(buf[(content + 1, 0)].fg, Color::Blue); // 'b' colored
+    }
+
+    #[test]
+    fn disabled_render_leaves_text_cells_default() {
+        // Data is present but coloring is off: identical to the old editor.
+        let lines = vec![String::from("abc")];
+        let mut state = colored_state(&[vec![run_at(0, 3, Color::Red)]], false);
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        for x in content..12 {
+            assert_eq!(buf[(x, 0)].fg, Color::Reset);
+            assert_eq!(buf[(x, 0)].bg, Color::Reset);
+        }
     }
 }
