@@ -35,8 +35,15 @@ impl InputState {
     }
 
     /// Replaces the text and puts the cursor at its end.
+    ///
+    /// Reuses the single line buffer instead of replacing the whole `Vec`.
     pub fn set_text(&mut self, text: impl Into<String>) {
-        self.text.lines = vec![text.into()];
+        if self.text.lines.is_empty() {
+            self.text.lines.push(String::new());
+        }
+
+        self.text.lines[0] = text.into();
+        self.text.lines.truncate(1);
         self.text.cursor = Cursor {
             x: self.text.lines[0].len(),
             y: 0,
@@ -44,8 +51,18 @@ impl InputState {
     }
 
     /// Forgets the text and resets the cursor.
+    ///
+    /// Keeps the line buffer allocated; the end state matches
+    /// [`TextState::default`].
     pub fn clear(&mut self) {
-        self.text = TextState::default();
+        self.text.lines.truncate(1);
+
+        if self.text.lines.is_empty() {
+            self.text.lines.push(String::new());
+        }
+
+        self.text.lines[0].clear();
+        self.text.cursor = Cursor::default();
     }
 
     /// Takes the text, leaving the box empty.

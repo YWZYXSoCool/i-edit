@@ -161,6 +161,11 @@ impl PickerState {
         self.actions.drain()
     }
 
+    /// Moves everything this component has asked for onto the end of `out`.
+    pub fn take_actions_into(&mut self, out: &mut Vec<Action>) {
+        self.actions.take_into(out)
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
             PickerMode::File | PickerMode::Folder => self.handle_browse_key(key),
@@ -236,15 +241,21 @@ impl PickerState {
     fn activate_enter(&mut self) {
         match self.highlighted_row() {
             Some(Row::Parent) => self.go_parent(),
-            Some(Row::Entry(entry)) if entry.is_dir => match self.mode {
-                // Folder mode chooses the directory; file mode browses into
-                // it, because picking a folder for the *tree* is a different
-                // intent from navigating there.
-                PickerMode::Folder => self.actions.emit(Action::LoadFolder(entry.path)),
-                _ => self.enter_dir(entry.path),
-            },
+            Some(Row::Entry(entry)) if entry.is_dir => {
+                // The path is copied out before acting, so the row borrow ends
+                // before the `&mut self` calls below.
+                let path = entry.path.clone();
+                match self.mode {
+                    // Folder mode chooses the directory; file mode browses
+                    // into it, because picking a folder for the *tree* is a
+                    // different intent from navigating there.
+                    PickerMode::Folder => self.actions.emit(Action::LoadFolder(path)),
+                    _ => self.enter_dir(path),
+                }
+            }
             Some(Row::Entry(entry)) if self.mode == PickerMode::File => {
-                self.actions.emit(Action::LoadFile(entry.path));
+                let path = entry.path.clone();
+                self.actions.emit(Action::LoadFile(path));
             }
             Some(Row::Entry(_)) => {}
             None => {}
@@ -255,9 +266,13 @@ impl PickerState {
     fn pick_for_save(&mut self) {
         match self.highlighted_row() {
             Some(Row::Parent) => self.go_parent(),
-            Some(Row::Entry(entry)) if entry.is_dir => self.enter_dir(entry.path),
+            Some(Row::Entry(entry)) if entry.is_dir => {
+                let path = entry.path.clone();
+                self.enter_dir(path);
+            }
             Some(Row::Entry(entry)) => {
-                self.name_input.set_text(entry.name);
+                let name = entry.name.clone();
+                self.name_input.set_text(name);
                 self.set_save_focus(SaveFocus::Name);
             }
             None => {}
@@ -268,7 +283,10 @@ impl PickerState {
     fn enter_highlighted(&mut self) {
         match self.highlighted_row() {
             Some(Row::Parent) => self.go_parent(),
-            Some(Row::Entry(entry)) if entry.is_dir => self.enter_dir(entry.path),
+            Some(Row::Entry(entry)) if entry.is_dir => {
+                let path = entry.path.clone();
+                self.enter_dir(path);
+            }
             _ => {}
         }
     }
@@ -294,20 +312,19 @@ impl PickerState {
     /// `Tab`: copy the highlighted row into the input, ending a directory with
     /// a separator so the refreshed listing shows its contents right away.
     fn complete_highlighted(&mut self) {
-        let Some(row) = self.highlighted_row() else {
-            return;
-        };
-
-        let text = match row {
-            Row::Parent => {
+        // The completed text is built while the rows are borrowed; the inputs
+        // are only touched once that borrow is over.
+        let text = match self.highlighted_row() {
+            Some(Row::Parent) => {
                 let current = expand_path(self.path_input.text());
                 match current.parent() {
                     Some(parent) if !parent.as_os_str().is_empty() => with_separator(parent),
                     _ => return,
                 }
             }
-            Row::Entry(entry) if entry.is_dir => with_separator(&entry.path),
-            Row::Entry(entry) => entry.path.to_string_lossy().into_owned(),
+            Some(Row::Entry(entry)) if entry.is_dir => with_separator(&entry.path),
+            Some(Row::Entry(entry)) => entry.path.to_string_lossy().into_owned(),
+            None => return,
         };
 
         self.path_input.set_text(text);
@@ -330,21 +347,21 @@ impl PickerState {
         }
     }
 
-    fn highlighted_row(&self) -> Option<Row> {
-        self.rows.get(self.highlighted).cloned()
+    fn highlighted_row(&self) -> Option<&Row> {
+        self.rows.get(self.highlighted)
     }
 
     /// `Ctrl+S` or `Enter` in the name field: hand the target to the shell.
     fn confirm_save(&mut self) {
-        let name = self.name_input.text().trim().to_owned();
-        if name.is_empty() {
+        if self.name_input.text().trim().is_empty() {
             // An empty file name cannot be joined into a path, so confirming
             // it is a no-op rather than an error.
             return;
         }
 
         let dir = expand_path(self.path_input.text());
-        self.actions.emit(Action::SaveTo(dir.join(name)));
+        self.actions
+            .emit(Action::SaveTo(dir.join(self.name_input.text().trim())));
     }
 
     fn toggle_save_focus(&mut self) {
@@ -371,17 +388,16 @@ impl PickerState {
     fn refresh(&mut self) {
         let path = expand_path(self.path_input.text());
 
-        self.rows = match list_dir(&path) {
-            Ok(entries) => {
-                let mut rows = Vec::with_capacity(entries.len() + 1);
-                if path.parent().is_some() {
-                    rows.push(Row::Parent);
-                }
-                rows.extend(entries.into_iter().map(Row::Entry));
-                rows
+        // Reuse the row buffer: this runs on every keystroke in the path box.
+        // A missing or unreadable directory stays an empty list, because
+        // `list_dir` fails before anything is pushed.
+        self.rows.clear();
+        if let Ok(entries) = list_dir(&path) {
+            if path.parent().is_some() {
+                self.rows.push(Row::Parent);
             }
-            Err(_) => Vec::new(),
-        };
+            self.rows.extend(entries.into_iter().map(Row::Entry));
+        }
 
         // The old highlight pointed into the old listing; both reset to the
         // top so the picker never acts on a stale row.

@@ -101,6 +101,11 @@ impl FileTreeState {
         self.actions.drain()
     }
 
+    /// Moves everything this component has asked for onto the end of `out`.
+    pub fn take_actions_into(&mut self, out: &mut Vec<Action>) {
+        self.actions.take_into(out)
+    }
+
     /// The flattened rows as of the last structural change.
     pub(crate) fn rows(&self) -> &[Row] {
         &self.rows

@@ -125,6 +125,15 @@ impl PopupState {
         actions
     }
 
+    /// Moves everything the popup asked for onto the end of `out`, the command
+    /// box's and the picker's requests included, in the same order
+    /// [`Self::take_actions`] merges them.
+    pub fn take_actions_into(&mut self, out: &mut Vec<Action>) {
+        self.actions.take_into(out);
+        self.command.take_actions_into(out);
+        self.picker.take_actions_into(out);
+    }
+
     /// Opens `kind` when the shell has no better starting point for it.
     ///
     /// Picker kinds are built on the process working directory with nothing

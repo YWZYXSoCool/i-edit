@@ -76,4 +76,10 @@ impl Actions {
     pub fn drain(&mut self) -> Vec<Action> {
         core::mem::take(&mut self.0)
     }
+
+    /// Moves everything queued onto the end of `out`, oldest first, leaving the
+    /// outbox empty but keeping its capacity.
+    pub(crate) fn take_into(&mut self, out: &mut Vec<Action>) {
+        out.append(&mut self.0)
+    }
 }

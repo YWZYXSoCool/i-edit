@@ -1,5 +1,4 @@
 use std::env;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::Result;
@@ -57,6 +56,9 @@ pub struct App {
     pending: Option<Action>,
     overwrite: Option<PathBuf>,
     last_dir: Option<PathBuf>,
+    /// Reused by [`Self::apply_actions`] so a steady stream of actions stops
+    /// reallocating the queue on every event.
+    actions_buf: Vec<Action>,
 }
 
 impl App {
@@ -72,6 +74,7 @@ impl App {
             pending: None,
             overwrite: None,
             last_dir: None,
+            actions_buf: Vec::new(),
         }
     }
 }
@@ -145,11 +148,16 @@ impl App {
     ///
     /// Returns `true` once quitting has been requested.
     fn apply_actions(&mut self) -> bool {
-        let mut actions = self.editor_state.take_actions();
-        actions.extend(self.popup_state.take_actions());
-        actions.extend(self.file_tree_state.take_actions());
+        self.actions_buf.clear();
+        self.editor_state.take_actions_into(&mut self.actions_buf);
+        self.popup_state.take_actions_into(&mut self.actions_buf);
+        self.file_tree_state
+            .take_actions_into(&mut self.actions_buf);
 
-        for action in actions {
+        // `pop` takes from the front of the reversed queue, so actions still
+        // run in the order they were queued.
+        self.actions_buf.reverse();
+        while let Some(action) = self.actions_buf.pop() {
             if self.apply(action) {
                 return true;
             }
@@ -208,6 +216,12 @@ impl App {
         }
     }
 
+    /// Integration-test entry point for a single action; not part of the public API.
+    #[doc(hidden)]
+    pub fn apply_for_test(&mut self, action: Action) -> bool {
+        self.apply(action)
+    }
+
     /// Opens a popup, giving the picker kinds their initial directory.
     fn open_popup(&mut self, kind: PopupKind) {
         match kind {
@@ -262,37 +276,22 @@ impl App {
             self.pending = Some(Action::LoadFile(path));
             self.popup_state.open_confirm(ConfirmKind::UnsavedChanges);
         } else {
-            self.load_file_now(&path);
+            self.load_file_now(path);
         }
     }
 
     /// Reads `path` and replaces the buffer. The original buffer is only kept
     /// when the read fails.
-    fn load_file_now(&mut self, path: &Path) {
+    fn load_file_now(&mut self, path: PathBuf) {
         self.popup_state.close();
 
-        match std::fs::OpenOptions::new().read(true).open(path) {
-            Ok(file) => {
-                let reader = BufReader::new(file);
-
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => {
-                            self.editor_state.text.lines.push(line);
-                        }
-
-                        Err(err) => {
-                            self.message_box_state.error(format!("cannot open: {err}"));
-                            return;
-                        }
-                    }
-                }
-
-                self.editor_state.path = Some(path.to_path_buf());
+        match fs::read_text_file(&path) {
+            Ok(lines) => {
                 self.last_dir = path.parent().map(Path::to_path_buf);
-                self.focus = Focus::Editor;
                 self.message_box_state
                     .success(format!("opened: {}", path.display()));
+                self.editor_state.load_file(path, lines);
+                self.focus = Focus::Editor;
             }
             Err(err) => {
                 self.message_box_state.error(format!("cannot open: {err}"));
@@ -313,9 +312,9 @@ impl App {
 
         self.file_tree_state.open_root(path.clone());
         self.file_tree_visible = true;
-        self.last_dir = Some(path.clone());
         self.message_box_state
             .success(format!("opened: {}", path.display()));
+        self.last_dir = Some(path);
     }
 
     /// Saves to the buffer's own path, or asks for one when it has none.
@@ -422,7 +421,7 @@ impl App {
         match action {
             Action::Quit => true,
             Action::LoadFile(path) => {
-                self.load_file_now(&path);
+                self.load_file_now(path);
                 false
             }
             other => self.apply(other),

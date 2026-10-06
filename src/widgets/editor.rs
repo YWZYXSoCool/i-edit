@@ -216,6 +216,11 @@ impl EditorState {
         self.actions.drain()
     }
 
+    /// Moves everything this component has asked for onto the end of `out`.
+    pub fn take_actions_into(&mut self, out: &mut Vec<Action>) {
+        self.actions.take_into(out)
+    }
+
     /// Replaces the buffer with a freshly loaded file and resets the view.
     pub fn load_file(&mut self, path: PathBuf, lines: Vec<String>) {
         self.text.load(lines);

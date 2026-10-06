@@ -198,32 +198,20 @@ impl TextState {
         }
 
         let line = &self.lines[self.cursor.y];
-        let chars: Vec<(usize, char)> = line.char_indices().collect();
         let mut pos = self.cursor.x;
 
-        while pos > 0 {
-            let prev_char = chars.iter().rev().find(|&&(i, _)| i < pos);
-            if let Some(&(_, c)) = prev_char {
-                if c.is_whitespace() {
-                    pos = prev_char.map(|&(i, _)| i).unwrap_or(0);
-                } else {
-                    break;
-                }
-            } else {
+        while let Some((idx, c)) = line[..pos].char_indices().next_back() {
+            if !c.is_whitespace() {
                 break;
             }
+            pos = idx;
         }
 
-        while pos > 0 {
-            let prev_char = chars.iter().rev().find(|&&(i, _)| i < pos);
-            if let Some(&(i, c)) = prev_char {
-                if !c.is_alphanumeric() && c != '_' {
-                    break;
-                }
-                pos = i;
-            } else {
+        while let Some((idx, c)) = line[..pos].char_indices().next_back() {
+            if !c.is_alphanumeric() && c != '_' {
                 break;
             }
+            pos = idx;
         }
 
         self.cursor.x = pos;
@@ -241,29 +229,18 @@ impl TextState {
             return;
         }
 
-        let chars: Vec<(usize, char)> = line.char_indices().collect();
         let mut pos = self.cursor.x;
 
-        while pos < line.len() {
-            let current_char = chars.iter().find(|&&(i, _)| i == pos);
-            if let Some(&(_, c)) = current_char {
-                if !c.is_alphanumeric() && c != '_' {
-                    break;
-                }
-                pos += c.len_utf8();
-            } else {
+        while let Some(c) = line[pos..].chars().next() {
+            if !c.is_alphanumeric() && c != '_' {
                 break;
             }
+            pos += c.len_utf8();
         }
 
-        while pos < line.len() {
-            let current_char = chars.iter().find(|&&(i, _)| i == pos);
-            if let Some(&(_, c)) = current_char {
-                if c.is_whitespace() {
-                    pos += c.len_utf8();
-                } else {
-                    break;
-                }
+        while let Some(c) = line[pos..].chars().next() {
+            if c.is_whitespace() {
+                pos += c.len_utf8();
             } else {
                 break;
             }
@@ -277,25 +254,20 @@ impl TextState {
 ///
 /// `x` is assumed to sit on a char boundary, as [`TextState`] keeps it.
 fn prev_char_boundary(line: &str, x: usize) -> usize {
-    let mut prev = 0;
-
-    for (idx, _) in line.char_indices() {
-        if idx >= x {
-            break;
-        }
-        prev = idx;
-    }
-
-    prev
+    line[..x]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(idx, _)| idx)
 }
 
 /// Byte offset where the char after `x` starts, `line.len()` at the end.
 ///
 /// `x` is assumed to sit on a char boundary, as [`TextState`] keeps it.
 fn next_char_boundary(line: &str, x: usize) -> usize {
-    line.char_indices()
-        .find(|&(idx, _)| idx > x)
-        .map_or(line.len(), |(idx, _)| idx)
+    line[x..]
+        .chars()
+        .next()
+        .map_or(line.len(), |c| x + c.len_utf8())
 }
 
 #[cfg(test)]

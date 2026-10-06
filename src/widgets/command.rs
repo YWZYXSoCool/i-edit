@@ -115,6 +115,11 @@ impl CommandPaletteState {
         self.actions.drain()
     }
 
+    /// Moves everything this component has asked for onto the end of `out`.
+    pub fn take_actions_into(&mut self, out: &mut Vec<Action>) {
+        self.actions.take_into(out)
+    }
+
     /// Starts accepting input. Text typed earlier is kept.
     pub fn open(&mut self) {
         self.input_state.is_editing = true;
