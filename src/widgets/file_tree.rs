@@ -6,7 +6,7 @@
 //! folder never walks the whole tree up front — that laziness is also what
 //! keeps symlink cycles harmless.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::action::{Action, Actions};
@@ -37,7 +37,7 @@ const SELECTED_STYLE: Style = Style::new().fg(Color::Black).bg(Color::White);
 
 /// One line of the flattened tree.
 #[derive(Debug)]
-struct Row {
+pub(crate) struct Row {
     path: PathBuf,
     name: String,
     is_dir: bool,
@@ -46,15 +46,26 @@ struct Row {
     expanded: bool,
 }
 
+/// Cache for one directory in the tree.
+#[derive(Debug)]
+struct Dir {
+    /// Children loaded the first time the directory is expanded; `None` means
+    /// it was never read. A failed read is cached as an empty list: a
+    /// directory that cannot be read should show nothing, not be retried on
+    /// every expansion.
+    children: Option<Vec<DirEntry>>,
+    /// Whether the children appear in the flattened rows.
+    expanded: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct FileTreeState {
     root: Option<PathBuf>,
-    /// Children per directory, loaded the first time it is expanded. A failed
-    /// read is cached as an empty list: a directory that cannot be read should
-    /// show nothing, not be retried on every expansion.
-    children: HashMap<PathBuf, Vec<DirEntry>>,
-    /// Directories whose children appear in the flattened rows.
-    expanded: HashSet<PathBuf>,
+    /// Per-directory cache, keyed by path: one `PathBuf` per directory rather
+    /// than one in each of several maps.
+    dirs: HashMap<PathBuf, Dir>,
+    /// Flattened rows, rebuilt on structural changes and read as-is otherwise.
+    rows: Vec<Row>,
     /// Index into the flattened rows.
     selected: usize,
     /// First row of the flattened list shown; fixed up at render time, when
@@ -74,8 +85,7 @@ impl FileTreeState {
     /// selection and scroll all belong to the old tree.
     pub fn open_root(&mut self, root: PathBuf) {
         self.root = Some(root.clone());
-        self.children.clear();
-        self.expanded.clear();
+        self.dirs.clear();
         self.selected = 0;
         self.scroll = 0;
         self.set_expanded(&root, true);
@@ -91,9 +101,14 @@ impl FileTreeState {
         self.actions.drain()
     }
 
+    /// The flattened rows as of the last structural change.
+    pub(crate) fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
     /// Moves the selection by `delta` rows, clamped to the ends.
     fn move_selection(&mut self, delta: isize) {
-        let row_count = self.visible_rows().len();
+        let row_count = self.rows.len();
         if row_count == 0 {
             return;
         }
@@ -105,16 +120,18 @@ impl FileTreeState {
     /// `Right`: expands a collapsed directory, steps into an expanded one, and
     /// does nothing on a file.
     fn expand_or_step_in(&mut self) {
-        let rows = self.visible_rows();
-        let Some(row) = rows.get(self.selected) else {
+        let Some(row) = self.rows.get(self.selected) else {
             return;
         };
         if !row.is_dir {
             return;
         }
 
-        if !row.expanded {
-            let path = row.path.clone();
+        let path = row.path.clone();
+        let expanded = row.expanded;
+        let depth = row.depth;
+
+        if !expanded {
             self.set_expanded(&path, true);
             self.clamp_selection();
             return;
@@ -122,8 +139,8 @@ impl FileTreeState {
 
         // Already open: step into the first child, which sits directly below
         // its parent in depth-first order. A childless directory stays put.
-        if let Some(child) = rows.get(self.selected + 1)
-            && child.depth == row.depth + 1
+        if let Some(child) = self.rows.get(self.selected + 1)
+            && child.depth == depth + 1
         {
             self.selected += 1;
         }
@@ -132,25 +149,27 @@ impl FileTreeState {
     /// `Left`: collapses an expanded directory, otherwise jumps to the parent
     /// row. The root has no parent, so that case is a no-op.
     fn collapse_or_step_out(&mut self) {
-        let rows = self.visible_rows();
-        let Some(row) = rows.get(self.selected) else {
+        let Some(row) = self.rows.get(self.selected) else {
             return;
         };
 
-        if row.is_dir && row.expanded {
-            let path = row.path.clone();
+        let path = row.path.clone();
+        let expanded_dir = row.is_dir && row.expanded;
+        let depth = row.depth;
+
+        if expanded_dir {
             self.set_expanded(&path, false);
             self.clamp_selection();
             return;
         }
 
-        let Some(parent_depth) = row.depth.checked_sub(1) else {
+        let Some(parent_depth) = depth.checked_sub(1) else {
             return;
         };
 
         // Depth-first order puts the nearest ancestor directly above `row`:
         // the first row at one level less.
-        if let Some(index) = rows[..self.selected]
+        if let Some(index) = self.rows[..self.selected]
             .iter()
             .rposition(|r| r.depth == parent_depth)
         {
@@ -160,14 +179,14 @@ impl FileTreeState {
 
     /// `Enter`: a directory toggles, a file asks the shell to load it.
     fn activate(&mut self) {
-        let rows = self.visible_rows();
-        let Some(row) = rows.get(self.selected) else {
+        let Some(row) = self.rows.get(self.selected) else {
             return;
         };
         let path = row.path.clone();
+        let is_dir = row.is_dir;
+        let expanded = row.expanded;
 
-        if row.is_dir {
-            let expanded = row.expanded;
+        if is_dir {
             self.set_expanded(&path, !expanded);
         } else {
             self.actions.emit(Action::LoadFile(path));
@@ -178,7 +197,7 @@ impl FileTreeState {
 
     /// Keeps the selection pointing at a row that still exists.
     fn clamp_selection(&mut self) {
-        let row_count = self.visible_rows().len();
+        let row_count = self.rows.len();
         if row_count == 0 {
             self.selected = 0;
             self.scroll = 0;
@@ -192,31 +211,39 @@ impl FileTreeState {
     ///
     /// A directory whose read fails caches an empty list, so the failure is
     /// not retried on every expansion. Children read earlier stay cached
-    /// through a collapse.
+    /// through a collapse. Collapsing a directory with no cache entry does
+    /// nothing; the rows are rebuilt either way, because the caller may be
+    /// reacting to a tree that changed elsewhere.
     fn set_expanded(&mut self, path: &Path, expanded: bool) {
-        if !expanded {
-            self.expanded.remove(path);
-            return;
+        if expanded {
+            let dir = self.dirs.entry(path.to_path_buf()).or_insert_with(|| Dir {
+                children: None,
+                expanded: false,
+            });
+            if dir.children.is_none() {
+                dir.children = Some(list_dir(path).unwrap_or_default());
+            }
+            dir.expanded = true;
+        } else if let Some(dir) = self.dirs.get_mut(path) {
+            dir.expanded = false;
         }
 
-        self.expanded.insert(path.to_path_buf());
-        if !self.children.contains_key(path) {
-            let children = list_dir(path).unwrap_or_default();
-            self.children.insert(path.to_path_buf(), children);
-        }
+        self.rebuild_rows();
     }
 
-    /// Flattens the expanded tree into the rows that are actually shown.
+    /// Rebuilds the flattened rows from the expanded directories.
     ///
-    /// Depth-first pre-order. An explicit stack is used so the walk is bounded
+    /// Depth-first pre-order, using an explicit stack so the walk is bounded
     /// by the user's expansions rather than by the file system: nothing is
-    /// recursed into until its directory was expanded and read.
-    fn visible_rows(&self) -> Vec<Row> {
+    /// recursed into until its directory was expanded and read. The vector is
+    /// cleared in place, so its capacity is reused across rebuilds.
+    fn rebuild_rows(&mut self) {
+        self.rows.clear();
+
         let Some(root) = self.root.as_deref() else {
-            return Vec::new();
+            return;
         };
 
-        let mut rows = Vec::new();
         let mut stack = vec![Row {
             path: root.to_path_buf(),
             name: root_name(root),
@@ -227,10 +254,13 @@ impl FileTreeState {
         }];
 
         while let Some(mut row) = stack.pop() {
-            row.expanded = row.is_dir && self.expanded.contains(&row.path);
+            row.expanded = row.is_dir && self.dirs.get(&row.path).is_some_and(|dir| dir.expanded);
 
             if row.expanded
-                && let Some(children) = self.children.get(&row.path)
+                && let Some(children) = self
+                    .dirs
+                    .get(&row.path)
+                    .and_then(|dir| dir.children.as_ref())
             {
                 let child_depth = row.depth + 1;
                 // Reverse so the first child comes off the stack first.
@@ -244,10 +274,8 @@ impl FileTreeState {
                 }));
             }
 
-            rows.push(row);
+            self.rows.push(row);
         }
-
-        rows
     }
 
     /// Scrolls the minimum amount that keeps the selection visible.
@@ -300,11 +328,11 @@ impl Component for FileTree {
             return;
         }
 
-        let Some(root) = state.root.clone() else {
+        if state.root.is_none() {
             // Nothing is open: a one-line hint is the whole panel.
             Line::from(Span::styled(NO_FOLDER_HINT, DIM_STYLE)).render(area, buf);
             return;
-        };
+        }
 
         // Left border only: a separator between the editor and the tree, not
         // an enclosure, so the rows start at the very next column.
@@ -330,10 +358,16 @@ impl Component for FileTree {
         let hint_height = u16::from(area.height >= ROOT_HINT_MIN_HEIGHT);
         let rows_height = inner.height.saturating_sub(hint_height) as usize;
 
-        let rows = state.visible_rows();
-        state.keep_selection_visible(rows.len(), rows_height);
+        let row_count = state.rows().len();
+        state.keep_selection_visible(row_count, rows_height);
 
-        for (offset, row) in rows.iter().skip(state.scroll).take(rows_height).enumerate() {
+        for (offset, row) in state
+            .rows()
+            .iter()
+            .skip(state.scroll)
+            .take(rows_height)
+            .enumerate()
+        {
             let row_area = Rect {
                 x: inner.x,
                 y: inner.y + offset as u16,
@@ -350,7 +384,9 @@ impl Component for FileTree {
                 width: inner.width,
                 height: 1,
             };
-            Line::from(Span::styled(root.display().to_string(), DIM_STYLE)).render(hint_area, buf);
+            if let Some(root) = state.root.as_deref() {
+                Line::from(Span::styled(root.to_string_lossy(), DIM_STYLE)).render(hint_area, buf);
+            }
         }
     }
 }
@@ -390,13 +426,28 @@ fn render_row(row: &Row, area: Rect, selected: bool, buf: &mut Buffer) {
         icon::FOLDER
     };
 
-    let mut text = "  ".repeat(row.depth);
-    text.push_str(marker);
-    text.push_str(folder);
-    text.push(' ');
-    text.push_str(&row.name);
+    // Two indent columns per level, written straight into the buffer; the
+    // part that does not fit is skipped just like the old text was clipped.
+    let indent = u16::try_from(row.depth.saturating_mul(2))
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    for x in area.x..area.x.saturating_add(indent) {
+        buf[(x, area.y)].set_char(' ').set_style(style);
+    }
 
-    Line::from(Span::styled(text, style)).render(area, buf);
+    let text = Rect {
+        x: area.x.saturating_add(indent),
+        y: area.y,
+        width: area.width.saturating_sub(indent),
+        height: 1,
+    };
+    Line::from(vec![
+        Span::styled(marker, style),
+        Span::styled(folder, style),
+        Span::styled(" ", style),
+        Span::styled(row.name.as_str(), style),
+    ])
+    .render(text, buf);
 }
 
 /// Name shown for the root row. A drive or share root has no file name, so it
@@ -465,11 +516,7 @@ mod tests {
     }
 
     fn row_names(state: &FileTreeState) -> Vec<String> {
-        state
-            .visible_rows()
-            .into_iter()
-            .map(|row| row.name)
-            .collect()
+        state.rows().iter().map(|row| row.name.clone()).collect()
     }
 
     /// Root with two directories, a hidden file and a regular file; `src`
@@ -527,21 +574,21 @@ mod tests {
             [root.as_str(), "docs", "src", ".hidden", "readme.md"]
         );
 
-        let rows = state.visible_rows();
+        let rows = state.rows();
         assert!(rows[0].is_dir && rows[0].expanded);
         // Nothing below the root has been read yet.
-        assert!(!state.children.contains_key(&dir.path().join("src")));
+        assert!(!state.dirs.contains_key(&dir.path().join("src")));
     }
 
     #[test]
     fn right_expands_a_directory_and_loads_its_children() {
         let (dir, mut state) = open_fixture();
-        assert!(!state.children.contains_key(&dir.path().join("src")));
+        assert!(!state.dirs.contains_key(&dir.path().join("src")));
 
         keys(&mut state, &[KeyCode::Down, KeyCode::Down]); // root -> docs -> src
         keys(&mut state, &[KeyCode::Right]);
 
-        assert!(state.children.contains_key(&dir.path().join("src")));
+        assert!(state.dirs.contains_key(&dir.path().join("src")));
         assert_eq!(state.selected, 2, "expanding does not move the selection");
 
         let root = root_name(&dir);
@@ -565,11 +612,11 @@ mod tests {
 
         keys(&mut state, &[KeyCode::Down, KeyCode::Down, KeyCode::Right]); // expand src
         keys(&mut state, &[KeyCode::Right]); // step into app.rs
-        assert_eq!(state.visible_rows()[state.selected].name, "app.rs");
+        assert_eq!(state.rows()[state.selected].name, "app.rs");
 
         keys(&mut state, &[KeyCode::Down, KeyCode::Right]); // main.rs; Right on a file does nothing
-        assert_eq!(state.visible_rows()[state.selected].name, "main.rs");
-        assert_eq!(state.visible_rows().len(), 7);
+        assert_eq!(state.rows()[state.selected].name, "main.rs");
+        assert_eq!(state.rows().len(), 7);
     }
 
     #[test]
@@ -582,10 +629,20 @@ mod tests {
         ); // src expanded, app.rs selected
         keys(&mut state, &[KeyCode::Left]); // back to src
         assert_eq!(state.selected, 2);
-        assert!(state.expanded.contains(&dir.path().join("src")));
+        assert!(
+            state
+                .dirs
+                .get(&dir.path().join("src"))
+                .is_some_and(|d| d.expanded)
+        );
 
         keys(&mut state, &[KeyCode::Left]); // collapse src
-        assert!(!state.expanded.contains(&dir.path().join("src")));
+        assert!(
+            !state
+                .dirs
+                .get(&dir.path().join("src"))
+                .is_some_and(|d| d.expanded)
+        );
         assert_eq!(state.selected, 2);
         assert_eq!(row_names(&state).len(), 5);
 
@@ -648,7 +705,7 @@ mod tests {
 
         // Selecting it inverts the whole row, dimness included.
         keys(&mut state, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
-        assert_eq!(state.visible_rows()[state.selected].name, ".hidden");
+        assert_eq!(state.rows()[state.selected].name, ".hidden");
 
         let mut buf = Buffer::empty(area);
         Component::render(FileTree, area, &mut buf, &mut state);
@@ -667,13 +724,13 @@ mod tests {
 
         keys(&mut state, &[KeyCode::Down, KeyCode::Down, KeyCode::Right]); // expand src
         keys(&mut state, &[KeyCode::Down]); // step into app.rs
-        assert_eq!(state.visible_rows()[state.selected].name, "app.rs");
+        assert_eq!(state.rows()[state.selected].name, "app.rs");
 
         keys(&mut state, &[KeyCode::Left]); // app.rs -> src
         assert_eq!(state.selected, 2);
         keys(&mut state, &[KeyCode::Left]); // collapse src
         assert_eq!(state.selected, 2);
-        assert_eq!(state.visible_rows().len(), 5);
+        assert_eq!(state.rows().len(), 5);
 
         // The ends clamp rather than run past the shorter list.
         keys(
@@ -682,7 +739,7 @@ mod tests {
         );
         assert_eq!(state.selected, 0);
         keys(&mut state, &[KeyCode::Down; 9]);
-        assert_eq!(state.selected, state.visible_rows().len() - 1);
+        assert_eq!(state.selected, state.rows().len() - 1);
     }
 
     #[test]
@@ -760,19 +817,23 @@ mod tests {
         ); // expand src, select app.rs
         state.scroll = 2;
         assert_eq!(state.selected, 3);
-        assert!(state.children.contains_key(&first_src));
+        assert!(state.dirs.contains_key(&first_src));
 
         let second = TempDir::new();
         state.open_root(second.path().to_path_buf());
 
         assert_eq!(state.selected, 0);
         assert_eq!(state.scroll, 0);
-        assert!(!state.children.contains_key(&first_src));
-        assert!(!state.expanded.contains(&first_src));
-        assert_eq!(state.children.len(), 1);
-        assert_eq!(state.expanded.len(), 1);
-        assert!(state.expanded.contains(second.path()));
-        assert_eq!(state.visible_rows().len(), 1);
+        assert!(!state.dirs.contains_key(&first_src));
+        assert_eq!(state.dirs.len(), 1);
+        assert_eq!(state.dirs.values().filter(|dir| dir.expanded).count(), 1);
+        assert!(
+            state
+                .dirs
+                .get(second.path())
+                .is_some_and(|dir| dir.expanded)
+        );
+        assert_eq!(state.rows().len(), 1);
     }
 
     #[test]
@@ -784,7 +845,7 @@ mod tests {
         state.open_root(missing.clone());
 
         assert_eq!(state.root(), Some(missing.as_path()));
-        let rows = state.visible_rows();
+        let rows = state.rows();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_dir && rows[0].expanded);
     }
@@ -799,7 +860,7 @@ mod tests {
         );
 
         assert_eq!(state.selected, 0);
-        assert_eq!(state.visible_rows().len(), 5);
+        assert_eq!(state.rows().len(), 5);
         assert!(state.take_actions().is_empty());
     }
 }
