@@ -1,5 +1,6 @@
-//! Phase 0 allocation baselines for the allocation-compression plan
-//! (`docs/allocation-plan.md` §4).
+//! Allocation-counting checks for the allocation-compression plan
+//! (`docs/allocation-plan.md` §4): the assertions pin the final upper bounds,
+//! and each comment records the Phase 0 baseline.
 //!
 //! # Counting allocator
 //!
@@ -22,11 +23,12 @@
 //!
 //! # Baselines
 //!
-//! Every assertion states the Phase 0 baseline measured with
-//! `cargo test --test alloc_counting -- --nocapture`; the plan asks for "≤ N",
-//! so margins are at most +1 where noted. Fixture creation, file reads and
-//! warmups all happen outside the measured windows. Windows file I/O is noisy,
-//! so the save point takes the minimum of three runs.
+//! The Phase 0 baselines were measured with
+//! `cargo test --test alloc_counting -- --nocapture` before the optimization;
+//! the plan asks for "≤ N", so margins are at most +1 where noted. Fixture
+//! creation, file reads and warmups all happen outside the measured windows.
+//! Windows file I/O is noisy, so the save point takes the minimum of three
+//! runs.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -39,6 +41,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use i_edit::action::Action;
+use i_edit::app::App;
 use i_edit::component::Component;
 use i_edit::fs::{read_text_file, write_text_file};
 use i_edit::widgets::command::{CommandPalette, CommandPaletteState};
@@ -194,9 +197,10 @@ fn editor_typing_100_chars() {
     });
 
     report("editor typing x100", allocs, 100);
-    // Phase 0 baseline (pre-optimization): 1. The warmup batch leaves the line
-    // at capacity 184, so the measured 100 inserts cross exactly one doubling
-    // boundary; after that the batch is amortized.
+    // Phase 0 baseline: 1; final: 1 (amortized `String` growth is kept, §3).
+    // The warmup batch leaves the line at capacity 184, so the measured 100
+    // inserts cross exactly one doubling boundary; after that the batch is
+    // amortized.
     assert!(allocs <= 1, "editor typing allocated {allocs} times");
 }
 
@@ -216,10 +220,8 @@ fn editor_down_100_keys() {
     });
 
     report("editor down x100", allocs, 100);
-    // Phase 0 baseline (pre-optimization): 4600 — 46 per key, from
-    // `find_best_char_position` allocating one `String` per character of the
-    // target line; +1 margin.
-    assert!(allocs <= 4601, "editor down allocated {allocs} times");
+    // Phase 0 baseline: 4600; final: 0 — movement is allocation-free now.
+    assert!(allocs <= 0, "editor down allocated {allocs} times");
 }
 
 #[test]
@@ -240,9 +242,8 @@ fn editor_ctrl_left_100_keys() {
     });
 
     report("editor ctrl+left x100", allocs, 100);
-    // Phase 0 baseline (pre-optimization): 300 — 3 per key from the
-    // `(usize, char)` collection in word movement (`src/text.rs`).
-    assert!(allocs <= 300, "editor ctrl+left allocated {allocs} times");
+    // Phase 0 baseline: 300; final: 0.
+    assert!(allocs <= 0, "editor ctrl+left allocated {allocs} times");
 }
 
 #[test]
@@ -262,9 +263,8 @@ fn editor_ctrl_right_100_keys() {
     });
 
     report("editor ctrl+right x100", allocs, 100);
-    // Phase 0 baseline (pre-optimization): 300 — 3 per key from the
-    // `(usize, char)` collection in word movement (`src/text.rs`).
-    assert!(allocs <= 300, "editor ctrl+right allocated {allocs} times");
+    // Phase 0 baseline: 300; final: 0.
+    assert!(allocs <= 0, "editor ctrl+right allocated {allocs} times");
 }
 
 #[test]
@@ -282,7 +282,7 @@ fn editor_render_frame_1k_lines() {
     let (_, allocs) = measure(|| Component::render(Editor, area, &mut buf, &mut state));
 
     report("editor frame 80x24 (1k lines)", allocs, 1);
-    // Phase 0 baseline (pre-optimization): 0.
+    // Phase 0 baseline: 0; final: 0.
     assert!(allocs <= 0, "editor frame allocated {allocs} times");
 }
 
@@ -310,9 +310,9 @@ fn file_tree_render_frame_100_children() {
     let (_, allocs) = measure(|| Component::render(FileTree, area, &mut buf, &mut state));
 
     report("file tree frame 80x24 (100 children)", allocs, 1);
-    // Phase 0 baseline (pre-optimization): 328 — every frame rebuilt the
-    // visible list and formatted each row's text from scratch; +1 margin.
-    assert!(allocs <= 329, "file tree frame allocated {allocs} times");
+    // Phase 0 baseline: 328; final: 24 (one `Line` Vec per visible row: 23
+    // rows plus the bottom path hint, §9.1).
+    assert!(allocs <= 24, "file tree frame allocated {allocs} times");
 }
 
 #[test]
@@ -336,9 +336,8 @@ fn file_tree_down_100_keys() {
     });
 
     report("file tree down x100", allocs, 100);
-    // Phase 0 baseline (pre-optimization): 21000 — 210 per key, dominated by
-    // the visible-row rebuild cloning a `PathBuf` and a name per row.
-    assert!(allocs <= 21000, "file tree down allocated {allocs} times");
+    // Phase 0 baseline: 21000; final: 0.
+    assert!(allocs <= 0, "file tree down allocated {allocs} times");
 }
 
 #[test]
@@ -367,9 +366,8 @@ fn file_tree_up_100_keys() {
     });
 
     report("file tree up x100", allocs, 100);
-    // Phase 0 baseline (pre-optimization): 21000 — 210 per key, dominated by
-    // the visible-row rebuild cloning a `PathBuf` and a name per row.
-    assert!(allocs <= 21000, "file tree up allocated {allocs} times");
+    // Phase 0 baseline: 21000; final: 0.
+    assert!(allocs <= 0, "file tree up allocated {allocs} times");
 }
 
 #[test]
@@ -397,10 +395,9 @@ fn file_tree_expand_subdirectory() {
         measure(|| Component::handle_event(FileTree, &press(KeyCode::Right), &mut state));
 
     report("file tree expand subdirectory", allocs, 1);
-    // Phase 0 baseline (pre-optimization): 210 (10 freshly listed children
-    // with a PathBuf and a name each, plus `rebuild_rows` cloning path and
-    // name for every row).
-    assert!(allocs <= 210, "file tree expand allocated {allocs} times");
+    // Phase 0 baseline: 210; final: 137 (`list_dir` allocates a PathBuf and a
+    // name per freshly listed child, §3).
+    assert!(allocs <= 137, "file tree expand allocated {allocs} times");
 }
 
 #[test]
@@ -429,10 +426,10 @@ fn picker_type_10_chars_and_render_frame() {
     });
 
     report("picker type 10 chars + frame (30 entries)", allocs, 1);
-    // Phase 0 baseline (pre-optimization): 71 (per keystroke: `expand_path`
-    // PathBuf + failing `list_dir` + a rows rebuild, then one render frame).
+    // Phase 0 baseline: 71; final: 62 (per keystroke: `expand_path` PathBuf +
+    // failing `list_dir` + a rows rebuild, then one render frame).
     assert!(
-        allocs <= 71,
+        allocs <= 62,
         "picker typing + frame allocated {allocs} times"
     );
 }
@@ -449,10 +446,10 @@ fn command_palette_render_frame() {
     let (_, allocs) = measure(|| Component::render(CommandPalette, area, &mut buf, &mut state));
 
     report("command palette frame 80x24", allocs, 1);
-    // Phase 0 baseline (pre-optimization): 31 — the placeholder and every
-    // suggestion row were formatted into fresh `String`s on each frame.
+    // Phase 0 baseline: 31; final: 8 (one line-span Vec per suggestion row,
+    // §9.1).
     assert!(
-        allocs <= 31,
+        allocs <= 8,
         "command palette frame allocated {allocs} times"
     );
 }
@@ -479,16 +476,15 @@ fn save_1k_lines() {
     }
 
     report("save 1k lines (min of 3)", best, 1);
-    // Phase 0 baseline (pre-optimization): min of 3 is 3 (the `join`-plus-
-    // `push` content String pays a growth realloc on the trailing newline,
-    // then Windows' write path adds one).
+    // Phase 0 baseline: min of 3 is 3; final: 2 (the exactly sized content
+    // String plus one Windows write-path allocation); +1 margin for I/O noise.
     assert!(best <= 3, "save allocated {best} times");
 }
 
 #[test]
 fn action_queue_steady_state() {
-    // TODO(Phase 0): the shell-side `App::apply` point needs a test hook on
-    // the shell; this test keeps the component-level queue path on the public
+    // The shell-side `App::apply` point lives in `app_apply_single_action`
+    // below; this test keeps the component-level queue path on the public
     // `drain` API.
     let mut palette = CommandPaletteState::new();
     let mut resident: Vec<Action> = Vec::new();
@@ -527,7 +523,42 @@ fn action_queue_steady_state() {
         "[alloc] action queue steady state: {total} total / {ROUNDS} rounds ({:.3} per round)",
         total as f64 / ROUNDS as f64
     );
-    // Phase 0 baseline (pre-optimization): 3000 over 1000 rounds — exactly 3
-    // per round on the public `drain` path.
-    assert!(total <= 3 * ROUNDS, "action queue allocated {total} times");
+    // Phase 0 baseline: 3000 over 1000 rounds; final: 1000 — exactly 1 per
+    // round, because the public `take_actions`/`drain` path still `mem::take`s
+    // the outbox and the next `emit` then reallocates it. The shell's
+    // capacity-preserving drain (`take_into`) is private and has no
+    // integration-test seam, so this public path is the closest reachable
+    // proxy.
+    assert!(total <= ROUNDS, "action queue allocated {total} times");
+}
+
+/// §4 point 7: one action through `App::apply`.
+///
+/// The shell's queue plumbing (`apply_actions`) is private, so this measures
+/// the action handler itself; the component-level queue cycle stays covered by
+/// `action_queue_steady_state` above.
+#[test]
+fn app_apply_single_action() {
+    let mut app = App::default();
+
+    // Setup outside the window: build the shell and warm the handler.
+    for _ in 0..100 {
+        app.apply_for_test(Action::ToggleFileTree);
+    }
+
+    const CALLS: usize = 100;
+    let (_, total) = measure(|| {
+        for _ in 0..CALLS {
+            app.apply_for_test(Action::ToggleFileTree);
+        }
+    });
+
+    println!(
+        "[alloc] App::apply one action: {total} total / {CALLS} calls ({:.3} per call)",
+        total as f64 / CALLS as f64
+    );
+    // Final: 0 over 100 calls — toggling the file tree panel is a flag flip
+    // with no allocation once the shell exists. No Phase 0 reading: `HEAD` had
+    // no `apply_for_test` hook to measure.
+    assert!(total <= 0, "App::apply allocated {total} times");
 }

@@ -17,7 +17,7 @@ use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::{DefaultTerminal, Frame};
 
-use log::info;
+use log::{debug, info};
 
 /// Key that quits the editor. Only reachable while no popup is open.
 const QUIT_KEY: KeyCode = KeyCode::Esc;
@@ -168,7 +168,7 @@ impl App {
 
     /// Runs a single action. Returns `true` for quitting the editor.
     fn apply(&mut self, action: Action) -> bool {
-        info!("action: {:?}", action);
+        debug!("action: {:?}", action);
 
         match action {
             Action::Quit => self.request_quit(),

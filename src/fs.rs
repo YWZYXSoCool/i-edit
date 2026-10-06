@@ -2,9 +2,10 @@
 //!
 //! The editor represents a document as a `Vec<String>` of lines; this module is
 //! the only place that translates between that representation and the bytes on
-//! disk. Files are UTF-8 text only, read with either line ending, and written
-//! back with `\n` and a trailing newline.
+//! disk. Files are UTF-8 text only, read line by line with either line ending,
+//! and written back with `\n` and a trailing newline.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Refuse to open files larger than this.
@@ -34,7 +35,8 @@ pub enum FsError {
     TooLarge(u64),
 }
 
-/// Reads `path` into lines.
+/// Reads `path` into lines, one at a time, so the whole file is never held in
+/// memory alongside the resulting lines.
 ///
 /// A trailing newline is not part of the document, so removing exactly one of
 /// them makes read -> write -> read a round trip. The result always holds at
@@ -46,28 +48,65 @@ pub fn read_text_file(path: &Path) -> Result<Vec<String>, FsError> {
         return Err(FsError::TooLarge(len));
     }
 
-    let bytes = std::fs::read(path)?;
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut lines = Vec::new();
+    // Bytes read so far, so the sniff window only covers the leading bytes.
+    let mut sniffed = 0usize;
 
-    // A NUL early in the file is the cheap binary tell; stopping after the
-    // sniff window keeps this O(1) in the file size.
-    if bytes.iter().take(BINARY_SNIFF_LEN).any(|&b| b == 0) {
-        return Err(FsError::NotText);
+    loop {
+        let mut buf = Vec::new();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+
+        // A NUL early in the file is the cheap binary tell; stopping after the
+        // sniff window keeps this O(1) in the file size.
+        let window = BINARY_SNIFF_LEN.saturating_sub(sniffed);
+        if buf[..window.min(buf.len())].contains(&0) {
+            return Err(FsError::NotText);
+        }
+        sniffed += buf.len();
+
+        // Trim the line ending in place, so the buffer read above can be moved
+        // into the result instead of allocated a second time.
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+        }
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+
+        // The byte-order mark is metadata and only ever leads the first line.
+        if lines.is_empty() && buf.starts_with("\u{feff}".as_bytes()) {
+            buf.drain(.."\u{feff}".len());
+        }
+
+        let line = String::from_utf8(buf).map_err(|_| FsError::NotText)?;
+        lines.push(line);
     }
 
-    let text = std::str::from_utf8(&bytes).map_err(|_| FsError::NotText)?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let text = text.strip_suffix('\n').unwrap_or(text);
+    // The editor never deals with a buffer that has no lines.
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
 
-    Ok(text
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
-        .collect())
+    Ok(lines)
 }
 
 /// Writes `lines` as UTF-8 text with `\n` separators and a trailing newline.
 pub fn write_text_file(path: &Path, lines: &[String]) -> Result<(), FsError> {
-    let mut content = lines.join("\n");
-    content.push('\n');
+    // One allocation, sized exactly: every line's bytes plus one newline each.
+    // An empty slice still writes a lone "\n", exactly as the old
+    // `join`-plus-`push` did, so `max(1)` keeps that case realloc-free too.
+    let capacity: usize = lines.iter().map(|line| line.len() + 1).sum();
+    let mut content = String::with_capacity(capacity.max(1));
+    if lines.is_empty() {
+        content.push('\n');
+    }
+    for line in lines {
+        content.push_str(line);
+        content.push('\n');
+    }
 
     std::fs::write(path, content)?;
     Ok(())
@@ -102,11 +141,22 @@ pub fn list_dir(path: &Path) -> Result<Vec<DirEntry>, FsError> {
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| lowercase_chars(&a.name).cmp(lowercase_chars(&b.name)))
             .then_with(|| a.name.cmp(&b.name))
     });
 
     Ok(entries)
+}
+
+/// Case-insensitive iteration over `name`, allocating nothing.
+///
+/// Folding character by character differs from `str::to_lowercase` only for the
+/// rare context-sensitive mappings, such as a Greek capital sigma at the end of
+/// a word (folded to `ς` as a whole string, to `σ` here). That cannot change
+/// how real file names sort, and comparing folded characters is still a total
+/// order.
+fn lowercase_chars(name: &str) -> impl Iterator<Item = char> + '_ {
+    name.chars().flat_map(char::to_lowercase)
 }
 
 /// Whether `name` is a dotfile. Windows hidden attributes are deliberately not
@@ -267,6 +317,31 @@ mod tests {
     }
 
     #[test]
+    fn write_text_file_keeps_the_join_based_bytes_on_edge_cases() {
+        let dir = TempDir::new();
+        let cases: [(&[&str], &str); 4] = [
+            // The old `join`-plus-`push` version wrote a lone newline even for
+            // an empty slice.
+            (&[], "\n"),
+            (&[""], "\n"),
+            (&["a"], "a\n"),
+            (&["a", "", "b"], "a\n\nb\n"),
+        ];
+
+        for (i, (lines, expected)) in cases.into_iter().enumerate() {
+            let path = dir.path().join(format!("write-{i}.txt"));
+            let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+            write_text_file(&path, &lines).unwrap();
+
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                expected,
+                "lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
     fn list_dir_sorts_dirs_first_and_flags_hidden_files() {
         let dir = TempDir::new();
         fs::create_dir(dir.path().join("zebra")).unwrap();
@@ -291,6 +366,22 @@ mod tests {
         assert!(entry(".hidden").is_hidden);
         assert!(!entry("beta.txt").is_hidden);
         assert!(!is_hidden_name("visible.txt"));
+    }
+
+    #[test]
+    fn list_dir_sorts_mixed_case_names_case_insensitively() {
+        let dir = TempDir::new();
+        for name in ["delta.txt", "Bravo.txt", "CHARLIE.txt", "alpha.txt"] {
+            fs::write(dir.path().join(name), "x").unwrap();
+        }
+
+        let entries = list_dir(dir.path()).unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        // A case-sensitive byte order would have put "Bravo.txt" first.
+        assert_eq!(
+            names,
+            ["alpha.txt", "Bravo.txt", "CHARLIE.txt", "delta.txt"]
+        );
     }
 
     #[test]
