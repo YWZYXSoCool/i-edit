@@ -73,3 +73,9 @@ impl<const N: usize> AsRef<str> for FixedBuf<N> {
         self.as_str()
     }
 }
+
+impl<const N: usize> PartialEq<&str> for FixedBuf<N> {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}

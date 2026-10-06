@@ -438,7 +438,11 @@ fn render_picker(area: Rect, buf: &mut Buffer, state: &mut PickerState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(BORDER_STYLE)
-        .title(format!("{} {}", icon::FOLDER, state.mode.title()));
+        .title(Line::from(vec![
+            Span::raw(icon::FOLDER),
+            Span::raw(" "),
+            Span::raw(state.mode.title()),
+        ]));
     block.render(area, buf);
 
     let inner = area.inner(Margin {
@@ -526,8 +530,13 @@ fn render_list(area: Rect, buf: &mut Buffer, state: &mut PickerState) {
         // the end of the name looks like a rendering bug.
         buf.set_style(row_area, style);
 
-        let text = clip_to_width(&row_text(row), area.width as usize);
-        Line::from(Span::styled(text, style)).render(row_area, buf);
+        let mut spans = row_spans(row, area.width as usize);
+        // The spans borrow the row and carry its style, so every cell the text
+        // writes keeps the style of the old joined-and-clipped span.
+        for span in &mut spans {
+            span.style = style;
+        }
+        Line::from(spans).render(row_area, buf);
     }
 
     if !state.has_entries() {
@@ -553,31 +562,57 @@ fn render_footer(area: Rect, buf: &mut Buffer, hint: &str) {
     Line::from(Span::styled(hint, DIM_STYLE)).render(area, buf);
 }
 
-fn row_text(row: &Row) -> String {
+/// One row of the list as borrowed, already clipped spans.
+///
+/// The spans come in rendered order — padding, marker, glyph, name and the
+/// trailing `/` of a directory — and each one only gets the width the previous
+/// ones leave free. Budgeting that way is column-for-column the same as
+/// clipping the whole assembled row, so the suffix is the first thing dropped
+/// when the space runs out.
+fn row_spans(row: &Row, max_width: usize) -> Vec<Span<'_>> {
     let (marker, glyph, name, suffix) = match row {
-        Row::Parent => (
-            icon::CHEVRON,
-            icon::FOLDER,
-            "
-..",
-            "",
-        ),
+        Row::Parent => (icon::CHEVRON, icon::FOLDER, "..", ""),
         Row::Entry(entry) if entry.is_dir => {
             (icon::CHEVRON, icon::FOLDER, entry.name.as_str(), "/")
         }
         Row::Entry(entry) => (" ", icon::FILE, entry.name.as_str(), ""),
     };
 
-    format!(" {marker}{glyph} {name}{suffix}")
+    let mut spans = Vec::with_capacity(6);
+    let mut used = 0;
+
+    for text in [" ", marker, glyph, " ", name, suffix] {
+        let clipped = clip_to_width(text, max_width - used);
+        used += display_width(clipped);
+        // A truncated span means the row ends there: the old whole-row clip
+        // stopped at the same column and dropped whatever followed.
+        let truncated = clipped.len() < text.len();
+        if !clipped.is_empty() {
+            spans.push(Span::raw(clipped));
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    spans
+}
+
+/// Display width of `text`, the sum [`clip_to_width`] budgets with.
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
 }
 
 /// Truncates `text` to `max_width` display columns.
 ///
 /// File names are arbitrary Unicode, so a byte-based cut could split a
-/// character or leave a double-width glyph hanging over the row's edge.
-fn clip_to_width(text: &str, max_width: usize) -> String {
+/// character or leave a double-width glyph hanging over the row's edge. The
+/// returned slice is on a char boundary and borrows from `text`.
+fn clip_to_width(text: &str, max_width: usize) -> &str {
     let mut width = 0;
-    let mut clipped = String::new();
+    let mut end = 0;
 
     for ch in text.chars() {
         let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
@@ -585,10 +620,10 @@ fn clip_to_width(text: &str, max_width: usize) -> String {
             break;
         }
         width += ch_width;
-        clipped.push(ch);
+        end += ch.len_utf8();
     }
 
-    clipped
+    &text[..end]
 }
 
 /// Renders `path` for the input box, ending in a separator when it names a
@@ -614,9 +649,11 @@ fn is_save_shortcut(key: &KeyEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Picker, PickerMode, PickerState, Row, with_separator};
+    use super::{Picker, PickerMode, PickerState, Row, clip_to_width, row_spans, with_separator};
     use crate::action::Action;
     use crate::component::Component;
+    use crate::fs::DirEntry;
+    use crate::icon;
 
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -626,6 +663,8 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+    use ratatui::text::Span;
+    use unicode_width::UnicodeWidthStr;
 
     /// A unique directory that deletes itself, so tests can run in parallel
     /// and leave nothing behind even when they panic.
@@ -751,6 +790,41 @@ mod tests {
             (area.x..area.right())
                 .any(|x| buf[(x, y)].symbol() == symbol && buf[(x, y)].style().fg == Some(color))
         })
+    }
+
+    fn file_row(name: &str) -> Row {
+        Row::Entry(DirEntry {
+            path: PathBuf::new(),
+            name: name.to_string(),
+            is_dir: false,
+            is_hidden: false,
+        })
+    }
+
+    fn dir_row(name: &str) -> Row {
+        Row::Entry(DirEntry {
+            path: PathBuf::new(),
+            name: name.to_string(),
+            is_dir: true,
+            is_hidden: false,
+        })
+    }
+
+    fn span_texts<'a>(spans: &'a [Span<'a>]) -> Vec<&'a str> {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    /// The visible text of one buffer row, advancing by each symbol's display
+    /// width so the placeholder cell behind a wide glyph is not duplicated.
+    fn visible_text(buf: &Buffer, area: Rect, y: u16) -> String {
+        let mut text = String::new();
+        let mut x = area.x;
+        while x < area.right() {
+            let symbol = buf[(x, y)].symbol();
+            text.push_str(symbol);
+            x = x.saturating_add(UnicodeWidthStr::width(symbol).max(1) as u16);
+        }
+        text
     }
 
     #[test]
@@ -1055,5 +1129,77 @@ mod tests {
 
         assert_eq!(state.path_input.text(), text_of(dir.path()).as_str());
         assert!(state.take_actions().is_empty());
+    }
+
+    /// A name is clipped on character boundaries: a double-width glyph that
+    /// does not fit whole is dropped, never left hanging over the row's edge.
+    #[test]
+    fn clipping_stops_in_front_of_a_wide_glyph_that_does_not_fit() {
+        assert_eq!(clip_to_width("中文名", 5), "中文");
+        assert_eq!(clip_to_width("中文名", 3), "中");
+        assert_eq!(clip_to_width("中文名", 1), "");
+        // Zero-width marks ride along with the character before them.
+        assert_eq!(clip_to_width("e\u{301}x", 1), "e\u{301}");
+    }
+
+    #[test]
+    fn row_spans_spend_the_width_in_order_and_drop_the_suffix_first() {
+        let file = file_row("中文名字.txt");
+        let spans = row_spans(&file, 8);
+        assert_eq!(span_texts(&spans), [" ", " ", icon::FILE, " ", "中文"]);
+
+        // A directory at a budget that just fits the name loses its `/` first.
+        let dir = dir_row("中文名");
+        let spans = row_spans(&dir, 10);
+        assert_eq!(
+            span_texts(&spans),
+            [" ", icon::CHEVRON, icon::FOLDER, " ", "中文名"]
+        );
+
+        let spans = row_spans(&Row::Parent, 40);
+        assert_eq!(
+            span_texts(&spans),
+            [" ", icon::CHEVRON, icon::FOLDER, " ", ".."]
+        );
+    }
+
+    #[test]
+    fn a_wide_name_cut_at_the_right_edge_stays_whole() {
+        let dir = TempDir::new();
+        let name = "中文文件名.txt";
+        fs::write(dir.path().join(name), "x").unwrap();
+
+        let mut state = picker(PickerMode::File, dir.path(), None);
+        select(&mut state, name);
+
+        // The picker is a percentage of the area, so sweep a few widths: the
+        // name may be shortened, but only on character boundaries.
+        for width in 10..=30 {
+            let area = Rect::new(0, 0, width, 10);
+            let buf = render(&mut state, area);
+
+            let row = (area.y..area.bottom())
+                .map(|y| visible_text(&buf, area, y))
+                .find(|row| row.contains('中'))
+                .unwrap_or_else(|| panic!("name row missing at width {width}"));
+
+            // Everything from the first glyph of the name on, up to the right
+            // border: a whole-character prefix, never a split one.
+            let visible = &row[row.find('中').unwrap()..];
+            let visible = visible.split('│').next().unwrap().trim_end();
+            assert!(
+                name.starts_with(visible),
+                "width {width} showed {visible:?}"
+            );
+        }
+
+        // With enough room the whole name shows.
+        let area = Rect::new(0, 0, 40, 12);
+        let buf = render(&mut state, area);
+        let row = (area.y..area.bottom())
+            .map(|y| visible_text(&buf, area, y))
+            .find(|row| row.contains('中'))
+            .expect("name row missing at 40 columns");
+        assert!(row.contains(name));
     }
 }

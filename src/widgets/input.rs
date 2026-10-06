@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::Cursor;
 use crate::component::Component;
 use crate::text::TextState;
@@ -133,14 +135,14 @@ impl<'a> Input<'a> {
     /// Password mode replaces the text with one `*` per char, so the cursor
     /// offset has to move from bytes to chars along with it. The offset comes
     /// in as bytes because that is what [`TextState`] stores.
-    fn display(&self, text: &str, cursor_x: usize) -> (String, usize) {
+    fn display<'t>(&'t self, text: &'t str, cursor_x: usize) -> (Cow<'t, str>, usize) {
         if self.password_mode && !text.is_empty() {
             (
-                "*".repeat(text.chars().count()),
+                Cow::Owned("*".repeat(text.chars().count())),
                 text[..cursor_x].chars().count(),
             )
         } else {
-            (text.to_string(), cursor_x)
+            (Cow::Borrowed(text), cursor_x)
         }
     }
 }
@@ -179,21 +181,22 @@ impl Component for Input<'_> {
         let (display_text, cursor_pos) = self.display(text, cursor_x);
 
         if !display_text.is_empty() {
-            let (before_cursor, after_cursor) = display_text.split_at(cursor_pos);
+            let (_, after_cursor) = display_text.split_at(cursor_pos);
 
-            let before_span = Span::styled(before_cursor.to_string(), current_style);
+            let before_span = Span::styled(&display_text[..cursor_pos], current_style);
 
             let cursor_char = if cursor_pos < display_text.len() {
                 after_cursor.chars().next().unwrap_or(' ')
             } else {
                 ' '
             };
-            let cursor_span = Span::styled(cursor_char.to_string(), self.cursor_style);
+            let mut cursor_buf = [0u8; 4];
+            let cursor_text: &str = cursor_char.encode_utf8(&mut cursor_buf);
+            let cursor_span = Span::styled(cursor_text, self.cursor_style);
 
-            let after_span = Span::styled(
-                after_cursor.chars().skip(1).collect::<String>(),
-                current_style,
-            );
+            let mut after_chars = after_cursor.chars();
+            after_chars.next();
+            let after_span = Span::styled(after_chars.as_str(), current_style);
 
             let line = Line::from(vec![before_span, cursor_span, after_span]);
             line.render(inner_area, buf);
@@ -201,10 +204,7 @@ impl Component for Input<'_> {
             let cursor_span = Span::styled(" ", self.cursor_style);
             cursor_span.render(inner_area, buf);
         } else if let Some(placeholder) = self.placeholder {
-            let placeholder_span = Span::styled(
-                placeholder.to_string(),
-                Style::default().fg(Color::DarkGray),
-            );
+            let placeholder_span = Span::styled(placeholder, Style::default().fg(Color::DarkGray));
             placeholder_span.render(inner_area, buf);
         }
     }

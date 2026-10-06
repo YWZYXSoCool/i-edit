@@ -10,10 +10,8 @@ use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Offset, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
-};
+use ratatui::text::Span;
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
 use unicode_width::UnicodeWidthStr;
 
 /// Lines jumped by PageUp / PageDown.
@@ -102,7 +100,17 @@ impl Component for Editor {
         if is_empty_scratch(state)
             && let Some(area) = welcome_area(content_area)
         {
-            Paragraph::new(welcome_text()).render(area, buf);
+            // One borrowed span per line: `Paragraph` would need an owned
+            // `Text`, which clones every line on every frame.
+            for (index, line) in WELCOME_LINES.iter().enumerate() {
+                let style = if index == 0 { TITLE_STYLE } else { HINT_STYLE };
+                let row = Rect {
+                    y: area.y + index as u16,
+                    height: 1,
+                    ..area
+                };
+                Span::styled(*line, style).render(row, buf);
+            }
         }
 
         // Render the vertical scrollbar in the remaining columns
@@ -147,18 +155,6 @@ impl Component for Editor {
 /// True while this is the never-saved startup buffer with nothing typed into it.
 fn is_empty_scratch(state: &EditorState) -> bool {
     state.path.is_none() && state.text.lines.iter().all(String::is_empty)
-}
-
-/// The welcome content with its first line emphasized.
-fn welcome_text() -> Vec<Line<'static>> {
-    WELCOME_LINES
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let style = if index == 0 { TITLE_STYLE } else { HINT_STYLE };
-            Line::from(Span::styled(*line, style))
-        })
-        .collect()
 }
 
 /// Where the welcome block goes: centered, or `None` when it does not fit.
@@ -444,6 +440,10 @@ mod tests {
         assert!(buf[(16, 1)].modifier.contains(Modifier::BOLD));
         assert_eq!(buf[(16, 4)].symbol(), "C");
         assert_eq!(buf[(16, 4)].fg, Color::DarkGray);
+        // The last hint keeps its own row and the dim style, so every welcome
+        // line is drawn, not only the first few.
+        assert_eq!(buf[(16, 10)].symbol(), "E");
+        assert_eq!(buf[(16, 10)].fg, Color::DarkGray);
     }
 
     #[test]

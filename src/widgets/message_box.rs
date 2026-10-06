@@ -208,7 +208,8 @@ impl MessageBox {
 
         Line::from(vec![
             Span::styled(message.kind.icon(), Style::new().fg(color)),
-            Span::styled(format!(" {}", message.text), Style::new().fg(Color::White)),
+            Span::raw(" "),
+            Span::styled(message.text.as_str(), Style::new().fg(Color::White)),
         ])
         .render(text_area, buf);
     }

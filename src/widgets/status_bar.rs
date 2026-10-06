@@ -19,6 +19,13 @@ use unicode_width::UnicodeWidthStr;
 /// `CONTROL+SHIFT+ALT+Backspace`. Overflowing writes fail instead of panicking.
 const KEY_INFO_CAPACITY: usize = 32;
 
+/// Capacity of the scratch buffer used to format the cursor position.
+///
+/// The longest result is `"Ln " + <line> + ", Col " + <column>`, and both
+/// numbers are `usize`: 3 + 20 + 7 + 20 = 50 bytes, comfortably inside 64.
+/// Overflowing writes fail instead of panicking.
+const POSITION_INFO_CAPACITY: usize = 64;
+
 /// Style applied to both halves of the bar.
 const STATUS_STYLE: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
 
@@ -126,36 +133,49 @@ impl<'a> StatusBar<'a> {
         self
     }
 
-    /// Formats the left half: buffer identity, dirty marker, then the recorded
+    /// Builds the left half: buffer identity, dirty marker, then the recorded
     /// key.
     ///
     /// The identity always comes first so the file being edited stays visible
-    /// no matter which key was pressed last.
-    fn left_info(&self, state: &StatusBarState) -> String {
-        let mut info = format!("{} {}", icon::FILE, self.file_name.unwrap_or("[scratch]"));
+    /// no matter which key was pressed last. `key_info` is a caller-owned
+    /// scratch buffer, so every span borrows from `self` or from it.
+    fn left_line<'b>(&'b self, key_info: &'b FixedBuf<KEY_INFO_CAPACITY>) -> Line<'b> {
+        let style = self.left_style;
+        let name = self.file_name.unwrap_or("[scratch]");
+
+        let mut spans = vec![
+            Span::styled(icon::FILE, style),
+            Span::styled(" ", style),
+            Span::styled(name, style),
+        ];
 
         if self.dirty {
-            info.push_str(" [+]");
+            spans.push(Span::styled(" [+]", style));
         }
 
-        let key_info = state.key_info();
         if !key_info.as_str().is_empty() {
-            let _ = write!(&mut info, "  {} {}", icon::KEYBOARD, key_info);
+            spans.push(Span::styled("  ", style));
+            spans.push(Span::styled(icon::KEYBOARD, style));
+            spans.push(Span::styled(" ", style));
+            spans.push(Span::styled(key_info.as_str(), style));
         }
 
-        info
+        Line::from(spans)
     }
 
     /// Formats the cursor position, both 1-based.
     ///
     /// The column counts display columns, not bytes, so a CJK or other wide
     /// character advances it by exactly one.
-    fn position_info(&self, state: &StatusBarState) -> String {
+    fn position_info(&self, state: &StatusBarState) -> FixedBuf<POSITION_INFO_CAPACITY> {
         let cursor = &state.cursor;
         let line = self.lines.get(cursor.y).map_or("", |line| line.as_str());
         let display_col = cursor.clamped_to(line).display_col(line);
 
-        format!("Ln {}, Col {}", cursor.y + 1, display_col + 1)
+        let mut buf = FixedBuf::new();
+        let _ = write!(&mut buf, "Ln {}, Col {}", cursor.y + 1, display_col + 1);
+
+        buf
     }
 }
 
@@ -187,33 +207,34 @@ impl Component for StatusBar<'_> {
             return;
         }
 
-        let right_info = format!("{} {}", icon::CURSOR, self.position_info(state));
-        let right_width = UnicodeWidthStr::width(right_info.as_str()) as u16;
+        let position = self.position_info(state);
+        // The cursor icon plus the space after it are one column each; every
+        // icon is single-width, as `icon.rs` pins down with a test.
+        let right_width = UnicodeWidthStr::width(position.as_str()) + 2;
 
-        let layout = Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]);
+        let layout =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width as u16)]);
         let [left_area, right_area] = layout.areas(area);
 
-        let left_info = self.left_info(state);
+        let key_info = state.key_info();
+        self.left_line(&key_info).render(left_area, buf);
 
-        render_text(&left_info, self.left_style, left_area, buf);
-        render_text(&right_info, self.right_style, right_area, buf);
+        let right_style = self.right_style;
+        Line::from(vec![
+            Span::styled(icon::CURSOR, right_style),
+            Span::styled(" ", right_style),
+            Span::styled(position.as_str(), right_style),
+        ])
+        .render(right_area, buf);
     }
-}
-
-/// Draws text left-aligned inside `area`, clipped to its width.
-fn render_text(text: &str, style: Style, area: Rect, buf: &mut Buffer) {
-    if text.is_empty() || area.is_empty() {
-        return;
-    }
-
-    Line::from(Span::styled(text, style)).render(area, buf);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{StatusBar, StatusBarState};
+    use super::{POSITION_INFO_CAPACITY, StatusBar, StatusBarState};
     use crate::Cursor;
     use crate::component::Component;
+    use crate::fixed_buf::FixedBuf;
     use crate::icon;
 
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -230,13 +251,25 @@ mod tests {
         (0..area.width).map(|x| buf[(x, 0)].symbol()).collect()
     }
 
-    fn position(lines: &[String], x: usize, y: usize) -> String {
+    fn position(lines: &[String], x: usize, y: usize) -> FixedBuf<POSITION_INFO_CAPACITY> {
         let state = StatusBarState {
             cursor: Cursor { x, y },
             ..Default::default()
         };
 
         StatusBar::new(lines).position_info(&state)
+    }
+
+    /// Rebuilds the left half as one string by concatenating the spans of the
+    /// line that `render` draws.
+    fn left_info(bar: StatusBar<'_>, state: &StatusBarState) -> String {
+        let key_info = state.key_info();
+
+        bar.left_line(&key_info)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     #[test]
@@ -268,9 +301,26 @@ mod tests {
         assert_eq!(position(&lines, 3, 7), "Ln 8, Col 1");
     }
 
+    /// Guards the capacity derivation noted in the allocation plan's risk
+    /// list: `"Ln " + <line> + ", Col " + <column>` is at most
+    /// 3 + 20 + 7 + 20 = 50 bytes, so the 64-byte buffer never truncates.
+    #[test]
+    fn a_max_length_line_number_fits_the_position_buffer() {
+        let digits = usize::MAX.to_string().len();
+        assert!(POSITION_INFO_CAPACITY >= "Ln ".len() + digits + ", Col ".len() + digits);
+
+        // `y = usize::MAX` would overflow the existing `cursor.y + 1` before
+        // formatting, so the largest line stays one short of it; an extreme
+        // `x` shows the clamped column cannot threaten the buffer either.
+        let lines: Vec<String> = vec![];
+        let info = position(&lines, usize::MAX, usize::MAX - 1);
+
+        assert_eq!(info.as_str(), format!("Ln {}, Col 1", usize::MAX));
+    }
+
     #[test]
     fn a_scratch_buffer_shows_no_name_or_dirty_marker() {
-        let info = StatusBar::new(&[]).left_info(&StatusBarState::default());
+        let info = left_info(StatusBar::new(&[]), &StatusBarState::default());
 
         assert!(info.contains("[scratch]"));
         assert!(!info.contains("[+]"));
@@ -278,10 +328,10 @@ mod tests {
 
     #[test]
     fn a_dirty_named_buffer_shows_its_name_and_marker() {
-        let info = StatusBar::new(&[])
-            .file_name(Some("app.rs"))
-            .dirty(true)
-            .left_info(&StatusBarState::default());
+        let info = left_info(
+            StatusBar::new(&[]).file_name(Some("app.rs")).dirty(true),
+            &StatusBarState::default(),
+        );
 
         assert_eq!(info, format!("{} app.rs [+]", icon::FILE));
     }
@@ -291,9 +341,7 @@ mod tests {
         let mut state = StatusBarState::default();
         state.record_key(KeyModifiers::CONTROL, KeyCode::Char('s'));
 
-        let info = StatusBar::new(&[])
-            .file_name(Some("app.rs"))
-            .left_info(&state);
+        let info = left_info(StatusBar::new(&[]).file_name(Some("app.rs")), &state);
 
         assert!(info.starts_with(&format!("{} app.rs", icon::FILE)));
         assert!(info.ends_with(&format!("  {} {}", icon::KEYBOARD, state.key_info())));

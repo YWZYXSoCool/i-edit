@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use crate::action::{Action, Actions};
 use crate::component::Component;
 use crate::icon;
@@ -25,6 +27,15 @@ const INPUT_HEIGHT: u16 = 3;
 /// Shown in the empty command box.
 const COMMAND_PLACEHOLDER: &str = "type a command…";
 
+/// [`COMMAND_PLACEHOLDER`] with its icon, built once instead of every frame.
+fn command_placeholder() -> &'static str {
+    static PLACEHOLDER: OnceLock<String> = OnceLock::new();
+
+    PLACEHOLDER
+        .get_or_init(|| format!("{} {COMMAND_PLACEHOLDER}", icon::COMMAND))
+        .as_str()
+}
+
 /// Highlight of the suggestion under the cursor.
 const SELECTED_STYLE: Style = Style::new().fg(Color::Black).bg(Color::White);
 
@@ -45,10 +56,13 @@ struct Command {
 impl Command {
     /// Case-insensitive prefix match against what has been typed so far.
     ///
-    /// Input is lowercased before matching, so command names must be written
-    /// lowercase.
+    /// Compares bytes in place instead of lowercasing the input, so command
+    /// names must be written lowercase ASCII; non-ASCII input simply fails to
+    /// match.
     fn matches(&self, input: &str) -> bool {
-        self.name.starts_with(input)
+        let name = self.name.as_bytes();
+        let input = input.as_bytes();
+        name.len() >= input.len() && name[..input.len()].eq_ignore_ascii_case(input)
     }
 }
 
@@ -175,15 +189,16 @@ impl CommandPaletteState {
     ///
     /// Empty input lists every command, so the box doubles as a palette.
     fn refresh_suggestions(&mut self) {
-        let input = self.input_state.text().to_lowercase();
-        let input = input.trim();
+        let input = self.input_state.text().trim();
 
-        self.suggestions = COMMANDS
-            .iter()
-            .enumerate()
-            .filter(|(_, command)| command.matches(input))
-            .map(|(idx, _)| idx)
-            .collect();
+        self.suggestions.clear();
+        self.suggestions.extend(
+            COMMANDS
+                .iter()
+                .enumerate()
+                .filter(|(_, command)| command.matches(input))
+                .map(|(idx, _)| idx),
+        );
 
         if self.selected_suggestion >= self.suggestions.len() {
             self.selected_suggestion = 0;
@@ -266,10 +281,8 @@ impl Component for CommandPalette {
         let [input_area, list_area] =
             Layout::vertical([Constraint::Length(INPUT_HEIGHT), Constraint::Fill(1)]).areas(area);
 
-        let placeholder = format!("{} {COMMAND_PLACEHOLDER}", icon::COMMAND);
-
         Component::render(
-            Input::new().placeholder(&placeholder),
+            Input::new().placeholder(command_placeholder()),
             input_area,
             buf,
             &mut state.input_state,
@@ -304,10 +317,14 @@ fn render_suggestions(area: Rect, buf: &mut Buffer, state: &CommandPaletteState)
         // Both markers are one column wide, so the rows stay aligned.
         let marker = if selected { icon::CHEVRON } else { " " };
 
-        Line::from(Span::styled(
-            format!(" {marker} {} · {}", command.name, command.description),
-            style,
-        ))
+        Line::from(vec![
+            Span::styled(" ", style),
+            Span::styled(marker, style),
+            Span::styled(" ", style),
+            Span::styled(command.name, style),
+            Span::styled(" · ", style),
+            Span::styled(command.description, style),
+        ])
         .render(row_area, buf);
     }
 }
@@ -413,12 +430,86 @@ mod tests {
     }
 
     #[test]
-    fn command_names_are_lowercase() {
-        // Input is lowercased before matching, so an uppercase name could
-        // never be typed.
+    fn command_names_are_ascii_lowercase() {
+        // Matching compares bytes in place, so command names must stay ASCII
+        // and lowercase.
         for command in COMMANDS {
+            assert!(command.name.is_ascii());
             assert_eq!(command.name, command.name.to_lowercase());
         }
+    }
+
+    #[test]
+    fn matching_is_equivalent_to_lowercasing_prefixes() {
+        // `Command::matches` avoids the `to_lowercase` allocation; uppercase,
+        // mixed-case and non-ASCII input must keep the old result.
+        let inputs = [
+            "",
+            "L",
+            "lo",
+            "LOG",
+            "Open",
+            "OPEN FILE",
+            "open file",
+            "Q",
+            "TOGGLE FILE TREE",
+            "打开",
+            "İstanbul",
+            "lö",
+        ];
+
+        for command in COMMANDS {
+            for input in inputs {
+                assert_eq!(
+                    command.matches(input),
+                    command.name.starts_with(&input.to_lowercase()),
+                    "{input:?} against {:?}",
+                    command.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uppercase_input_filters_the_suggestions() {
+        let mut state = CommandPaletteState::new();
+        state.open();
+
+        for ch in "OPEN FILE".chars() {
+            Component::handle_event(CommandPalette, &press(KeyCode::Char(ch)), &mut state);
+        }
+
+        assert_eq!(state.suggestions.len(), 1);
+        assert_eq!(COMMANDS[state.suggestions[0]].name, "open file");
+    }
+
+    #[test]
+    fn mixed_case_input_filters_the_suggestions() {
+        let mut state = CommandPaletteState::new();
+        state.open();
+
+        for ch in "Open".chars() {
+            Component::handle_event(CommandPalette, &press(KeyCode::Char(ch)), &mut state);
+        }
+
+        let names: Vec<&str> = state
+            .suggestions
+            .iter()
+            .map(|&idx| COMMANDS[idx].name)
+            .collect();
+        assert_eq!(names, vec!["open file", "open folder"]);
+    }
+
+    #[test]
+    fn non_ascii_input_matches_no_command() {
+        let mut state = CommandPaletteState::new();
+        state.open();
+
+        for ch in "打开".chars() {
+            Component::handle_event(CommandPalette, &press(KeyCode::Char(ch)), &mut state);
+        }
+
+        assert!(state.suggestions.is_empty());
     }
 
     #[test]
