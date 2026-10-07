@@ -14,6 +14,14 @@ pub const MAX_VIEWS: usize = 200;
 /// Expanded directories remembered for the file tree.
 pub const MAX_EXPANDED_DIRS: usize = 500;
 
+/// Tabs reopened on startup.
+///
+/// Restoring one means reading its file, so a session that left hundreds open
+/// is cut short rather than turning the start into a hundred reads: the tabs
+/// that come back are the first ones in stored order, the rest are left for
+/// the user to open again.
+pub const MAX_TABS: usize = 32;
+
 /// Where a buffer was left: cursor line, byte column, and the top line shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileView {
@@ -28,10 +36,14 @@ pub struct FileView {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Session {
-    /// Buffer to reopen; `None` when the last run ended on a scratch buffer.
+    /// Buffer to reopen, and of the tabs below the one that was current;
+    /// `None` when the last run ended on a scratch buffer.
     pub last_file: Option<PathBuf>,
     /// Folder to reopen as the file tree root.
     pub last_folder: Option<PathBuf>,
+    /// The file-backed buffers that were open, in tab-bar order. Scratch
+    /// buffers have no path to read back, so they are not in here.
+    tabs: Vec<PathBuf>,
     /// Most recently viewed first.
     views: Vec<FileView>,
     /// Directories left expanded in the file tree.
@@ -43,6 +55,7 @@ impl Session {
         let mut session = Self {
             last_file: doc.get("last_file").map(PathBuf::from),
             last_folder: doc.get("folder").map(PathBuf::from),
+            tabs: Vec::new(),
             views: Vec::new(),
             expanded: Vec::new(),
         };
@@ -76,6 +89,11 @@ impl Session {
             session.expanded.push(PathBuf::from(path));
         }
 
+        // One `tab` line per open buffer, in the order the bar showed them.
+        for path in doc.all("tab").take(MAX_TABS) {
+            session.tabs.push(PathBuf::from(path));
+        }
+
         session
     }
 
@@ -107,7 +125,34 @@ impl Session {
             doc.push("expanded", path.display().to_string());
         }
 
+        for path in &self.tabs {
+            doc.push("tab", path.display().to_string());
+        }
+
         doc
+    }
+
+    /// The tabs to reopen on the next run, in the order they were left in.
+    pub fn tabs(&self) -> &[PathBuf] {
+        &self.tabs
+    }
+
+    /// Records which buffers are open, replacing whatever was remembered.
+    ///
+    /// Duplicates collapse — two tabs cannot hold the same file — and the
+    /// list is cut at [`MAX_TABS`], so a hand-edited or very old session
+    /// cannot ask the next run to read hundreds of files.
+    pub fn set_tabs(&mut self, tabs: impl IntoIterator<Item = PathBuf>) {
+        self.tabs.clear();
+
+        for path in tabs {
+            if self.tabs.contains(&path) {
+                continue;
+            }
+            self.tabs.push(path);
+        }
+
+        self.tabs.truncate(MAX_TABS);
     }
 
     /// Where `path` was left, if it was left anywhere.
@@ -142,6 +187,15 @@ impl Session {
     /// paths that are no longer in the tree.
     pub fn set_folder(&mut self, folder: PathBuf) {
         self.last_folder = Some(folder);
+        self.expanded.clear();
+    }
+
+    /// Forgets the folder and the expansion set that belonged to it.
+    ///
+    /// The counterpart of [`Self::set_folder`]: without it the next run would
+    /// reopen a folder the user has just closed.
+    pub fn clear_folder(&mut self) {
+        self.last_folder = None;
         self.expanded.clear();
     }
 

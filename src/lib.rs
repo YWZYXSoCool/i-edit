@@ -7,6 +7,7 @@ pub mod fixed_buf;
 pub mod fs;
 pub mod highlight;
 pub mod icon;
+pub mod lsp;
 pub mod shortcuts;
 pub mod storage;
 pub mod text;

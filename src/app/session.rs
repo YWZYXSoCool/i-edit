@@ -5,7 +5,7 @@
 //! scratch buffer in place — the editor starting on an empty buffer is fine,
 //! refusing to start is not.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::Cursor;
 use crate::app::App;
@@ -37,10 +37,46 @@ impl App {
             self.restore_folder(folder);
         }
 
+        let tabs: Vec<PathBuf> = self.storage.session().tabs().to_vec();
         let file = self.storage.session().last_file.clone();
-        if let Some(file) = file {
-            self.restore_file(file);
+
+        // A session written before the tab bar was remembered has no `tab`
+        // lines; `last_file` is still there, so one buffer comes back.
+        if tabs.is_empty() {
+            if let Some(file) = file {
+                self.restore_file(file);
+            }
+            return;
         }
+
+        self.restore_tabs(tabs, file.as_deref());
+    }
+
+    /// Reopens the whole tab bar: every buffer the last run left open, in
+    /// order, with the one that was current focused again.
+    ///
+    /// A file that no longer reads is reported and skipped rather than
+    /// stopping the ones behind it — one deleted file should not cost the
+    /// rest of the bar.
+    fn restore_tabs(&mut self, paths: Vec<PathBuf>, current: Option<&Path>) {
+        let mut focused = None;
+
+        for path in &paths {
+            if let Some(index) = self.restore_tab(path)
+                && Some(path.as_path()) == current
+            {
+                focused = Some(index);
+            }
+        }
+
+        if let Some(index) = focused {
+            self.tabs.set_active(index);
+        }
+
+        // Every buffer but the last was filled behind the language server's
+        // back: it is told once, about the file the editor is starting on,
+        // and the rest are handed over as they are looked at.
+        self.sync_lsp();
     }
 
     /// Roots the tree at `path` and re-expands the directories it left open.
@@ -76,40 +112,63 @@ impl App {
 
     /// Reads `path` into the buffer and puts the cursor back where it was.
     fn restore_file(&mut self, path: PathBuf) {
+        if self.restore_tab(&path).is_some() {
+            // The buffer was filled behind the language server's back, so
+            // tell it now — otherwise the file the editor starts on is the
+            // one file that never gets colored.
+            self.sync_lsp();
+        }
+    }
+
+    /// Reads `path` into its own tab and puts the cursor back where it was.
+    /// Returns the index of the tab it landed in, or `None` on a failed read.
+    fn restore_tab(&mut self, path: &Path) -> Option<usize> {
         let saved = self
             .storage
             .session()
-            .view(&path)
+            .view(path)
             .map(|view| (view.line, view.col, view.top));
 
-        match fs::read_text_file(&path) {
+        match fs::read_text_file(path) {
             Ok(lines) => {
-                self.editor_state.load_file(path.clone(), lines);
-
-                if let Some((line, col, top)) = saved {
-                    // The file may have shrunk or changed since; `clamp_cursor`
-                    // puts the cursor back inside it and on a char boundary.
-                    self.editor_state.text.cursor = Cursor { x: col, y: line };
-                    self.editor_state.text.clamp_cursor();
-                    self.editor_state.viewport_state.scroll_y = top;
-                }
+                let index = self.tabs.focus_or_open(path.to_path_buf(), lines);
+                self.restore_view(index, saved);
+                Some(index)
             }
             Err(err) => {
                 self.message_box_state
                     .error(format!("cannot reopen: {err}"));
+                None
             }
         }
     }
 
-    /// Records where the current buffer is, so a return to it starts there.
-    pub(super) fn remember_current_view(&mut self) {
-        let Some(path) = self.editor_state.path.clone() else {
+    /// Puts the cursor of tab `index` back where it was left.
+    fn restore_view(&mut self, index: usize, saved: Option<(usize, usize, usize)>) {
+        let Some((line, col, top)) = saved else {
             return;
         };
 
-        let line = self.editor_state.text.cursor.y;
-        let col = self.editor_state.text.cursor.x;
-        let top = self.editor_state.viewport_state.scroll_y;
+        self.tabs.set_active(index);
+
+        // The file may have shrunk or changed since; `clamp_cursor` puts the
+        // cursor back inside it and on a char boundary.
+        let buffer = self.tabs.active_mut();
+        buffer.text.cursor = Cursor { x: col, y: line };
+        buffer.text.clamp_cursor();
+        buffer.viewport_state.scroll_y = top;
+    }
+
+    /// Records where the current buffer is, so a return to it starts there.
+    pub(super) fn remember_current_view(&mut self) {
+        let Some(path) = self.tabs.active().path.clone() else {
+            return;
+        };
+
+        let buffer = self.tabs.active();
+        let line = buffer.text.cursor.y;
+        let col = buffer.text.cursor.x;
+        let top = buffer.viewport_state.scroll_y;
 
         self.storage
             .edit_session(|session| session.remember_view(path, line, col, top));

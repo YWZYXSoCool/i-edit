@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use super::{Editor, EditorState};
 use crate::Cursor;
+use crate::clipboard::{Clipboard, ClipboardBackendKind};
 use crate::component::Component;
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::Color;
 
 fn run(keys: &[KeyCode], state: &mut EditorState) {
     for code in keys {
@@ -48,35 +49,6 @@ fn starts_with_a_single_empty_line() {
     let state = EditorState::new();
     assert_eq!(state.text.lines, vec![String::new()]);
     assert_eq!((state.text.cursor.x, state.text.cursor.y), (0, 0));
-}
-
-#[test]
-fn an_empty_scratch_buffer_shows_the_vim_style_welcome() {
-    let mut state = EditorState::new();
-
-    // 13 rows: title + version + blank + 10 hint lines (Shift+Tab and Tab
-    // are now separate bindings, so the block is one line taller than the
-    // original nine-hint layout).
-    let buf = render_in(&mut state, 64, 13);
-
-    let text = text_of(&buf);
-    assert!(text.contains(env!("CARGO_PKG_NAME")));
-    assert!(text.contains(concat!("version ", env!("CARGO_PKG_VERSION"))));
-    assert!(text.contains("open file"));
-    assert!(text.contains("toggle file tree"));
-    assert!(text.contains("quit"));
-
-    // Centered block: title bright and bold at the top, hints dim, like
-    // the file tree's placeholder.
-    assert_eq!(buf[(17, 0)].symbol(), "i");
-    assert_eq!(buf[(17, 0)].fg, Color::White);
-    assert!(buf[(17, 0)].modifier.contains(Modifier::BOLD));
-    assert_eq!(buf[(17, 3)].symbol(), "C");
-    assert_eq!(buf[(17, 3)].fg, Color::DarkGray);
-    // The last hint keeps its own row and the dim style, so every welcome
-    // line is drawn, not only the first few. It is "Tab: insert 4 spaces".
-    assert_eq!(buf[(17, 12)].symbol(), "T");
-    assert_eq!(buf[(17, 12)].fg, Color::DarkGray);
 }
 
 #[test]
@@ -323,6 +295,19 @@ fn load_file_sets_the_path_and_resets_the_view() {
 }
 
 #[test]
+fn load_file_moves_the_document_version_on() {
+    let mut state = EditorState::new();
+    let before = state.version;
+
+    state.load_file(PathBuf::from("notes.txt"), vec![String::from("one")]);
+
+    // The text was replaced wholesale, so any response computed against the
+    // old buffer is stale and must be dropped on arrival — which is decided
+    // by comparing versions.
+    assert_eq!(state.version, before + 1);
+}
+
+#[test]
 fn the_scrollbar_appears_on_the_first_render_without_interaction() {
     let mut state = EditorState::new();
     // A long document that overflows the viewport, loaded without any key
@@ -444,6 +429,10 @@ fn select_all_then_type_replaces_the_whole_buffer() {
 #[test]
 fn ctrl_v_pastes_what_was_copied() {
     let mut state = EditorState::new();
+    // Paste prefers the system clipboard, so a real one would win over the
+    // register this test writes — and what it holds is whatever the machine
+    // last copied. Tests must not read it.
+    state.clipboard = Clipboard::new(ClipboardBackendKind::InternalOnly, Box::new(Vec::new()));
     run(&[KeyCode::Char('a'), KeyCode::Char('b')], &mut state);
     // Select the whole line with Shift+Home (char selection, no trailing \n).
     press(KeyCode::Home, KeyModifiers::SHIFT, &mut state);

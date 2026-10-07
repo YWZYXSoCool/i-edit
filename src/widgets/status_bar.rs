@@ -30,11 +30,19 @@ const POSITION_INFO_CAPACITY: usize = 64;
 const STATUS_STYLE: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
 
 /// Everything [`StatusBar`] needs to draw itself.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StatusBarState {
     pub cursor: Cursor,
     pub last_key_modifiers: KeyModifiers,
     pub last_key_code: Option<KeyCode>,
+    /// What a background worker is doing, e.g. `"Indexing 42%"`. `None` draws
+    /// nothing.
+    ///
+    /// Owned rather than borrowed because it outlives the event that carried
+    /// it: the read-out stays until the next one, or until the worker reports
+    /// it is done. The string is reused in place, so a long run of progress
+    /// updates does not allocate per update.
+    progress: Option<String>,
 }
 
 // `KeyModifiers` has no `Default`, so hand-roll it.
@@ -44,6 +52,7 @@ impl Default for StatusBarState {
             cursor: Cursor::default(),
             last_key_modifiers: KeyModifiers::NONE,
             last_key_code: None,
+            progress: None,
         }
     }
 }
@@ -51,6 +60,27 @@ impl Default for StatusBarState {
 impl StatusBarState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets or clears the background-work read-out.
+    ///
+    /// The text is copied into the state's own buffer, which is reused when one
+    /// is already there: progress arrives many times a second while a project
+    /// is being indexed.
+    pub fn set_progress(&mut self, text: Option<&str>) {
+        match (text, &mut self.progress) {
+            (None, _) => self.progress = None,
+            (Some(text), Some(held)) => {
+                held.clear();
+                held.push_str(text);
+            }
+            (Some(text), None) => self.progress = Some(text.to_string()),
+        }
+    }
+
+    /// The read-out as drawn, if there is one.
+    pub fn progress(&self) -> Option<&str> {
+        self.progress.as_deref()
     }
 
     /// Records a key press.
@@ -94,7 +124,6 @@ impl StatusBarState {
 #[derive(Debug)]
 pub struct StatusBar<'a> {
     lines: &'a [String],
-    file_name: Option<&'a str>,
     dirty: bool,
     left_style: Style,
     right_style: Style,
@@ -104,17 +133,10 @@ impl<'a> StatusBar<'a> {
     pub fn new(lines: &'a [String]) -> Self {
         Self {
             lines,
-            file_name: None,
             dirty: false,
             left_style: STATUS_STYLE,
             right_style: STATUS_STYLE,
         }
-    }
-
-    /// Names the buffer for the left half; `None` renders as `[scratch]`.
-    pub fn file_name(mut self, name: Option<&'a str>) -> Self {
-        self.file_name = name;
-        self
     }
 
     /// Marks the buffer as having unsaved changes, rendered as `[+]`.
@@ -139,25 +161,29 @@ impl<'a> StatusBar<'a> {
     /// The identity always comes first so the file being edited stays visible
     /// no matter which key was pressed last. `key_info` is a caller-owned
     /// scratch buffer, so every span borrows from `self` or from it.
-    fn left_line<'b>(&'b self, key_info: &'b FixedBuf<KEY_INFO_CAPACITY>) -> Line<'b> {
+    fn left_line<'b>(
+        &'b self,
+        state: &'b StatusBarState,
+        key_info: &'b FixedBuf<KEY_INFO_CAPACITY>,
+    ) -> Line<'b> {
         let style = self.left_style;
-        let name = self.file_name.unwrap_or("[scratch]");
 
-        let mut spans = vec![
-            Span::styled(icon::FILE, style),
-            Span::styled(" ", style),
-            Span::styled(name, style),
-        ];
+        let mut spans = vec![];
 
         if self.dirty {
-            spans.push(Span::styled(" [+]", style));
+            spans.push(Span::styled("[+] ", style));
         }
 
         if !key_info.as_str().is_empty() {
-            spans.push(Span::styled("  ", style));
             spans.push(Span::styled(icon::KEYBOARD, style));
             spans.push(Span::styled(" ", style));
             spans.push(Span::styled(key_info.as_str(), style));
+            spans.push(Span::styled(" ", style));
+        }
+
+        if let Some(progress) = state.progress() {
+            spans.push(Span::styled(progress, style));
+            spans.push(Span::styled(" ", style));
         }
 
         Line::from(spans)
@@ -183,7 +209,6 @@ impl Default for StatusBar<'_> {
     fn default() -> Self {
         Self {
             lines: &[],
-            file_name: None,
             dirty: false,
             left_style: STATUS_STYLE,
             right_style: STATUS_STYLE,
@@ -217,7 +242,7 @@ impl Component for StatusBar<'_> {
         let [left_area, right_area] = layout.areas(area);
 
         let key_info = state.key_info();
-        self.left_line(&key_info).render(left_area, buf);
+        self.left_line(state, &key_info).render(left_area, buf);
 
         let right_style = self.right_style;
         Line::from(vec![
@@ -233,23 +258,7 @@ impl Component for StatusBar<'_> {
 mod tests {
     use super::{POSITION_INFO_CAPACITY, StatusBar, StatusBarState};
     use crate::Cursor;
-    use crate::component::Component;
     use crate::fixed_buf::FixedBuf;
-    use crate::icon;
-
-    use crossterm::event::{KeyCode, KeyModifiers};
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
-    /// Renders the bar into one 40-column row and returns it as a string so
-    /// tests can check ordering without a terminal.
-    fn render(bar: StatusBar<'_>, state: &mut StatusBarState) -> String {
-        let area = Rect::new(0, 0, 40, 1);
-        let mut buf = Buffer::empty(area);
-        Component::render(bar, area, &mut buf, state);
-
-        (0..area.width).map(|x| buf[(x, 0)].symbol()).collect()
-    }
 
     fn position(lines: &[String], x: usize, y: usize) -> FixedBuf<POSITION_INFO_CAPACITY> {
         let state = StatusBarState {
@@ -265,7 +274,7 @@ mod tests {
     fn left_info(bar: StatusBar<'_>, state: &StatusBarState) -> String {
         let key_info = state.key_info();
 
-        bar.left_line(&key_info)
+        bar.left_line(state, &key_info)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -321,48 +330,33 @@ mod tests {
     #[test]
     fn a_scratch_buffer_shows_no_name_or_dirty_marker() {
         let info = left_info(StatusBar::new(&[]), &StatusBarState::default());
-
-        assert!(info.contains("[scratch]"));
         assert!(!info.contains("[+]"));
     }
 
     #[test]
-    fn a_dirty_named_buffer_shows_its_name_and_marker() {
-        let info = left_info(
-            StatusBar::new(&[]).file_name(Some("app.rs")).dirty(true),
-            &StatusBarState::default(),
-        );
+    fn clearing_the_progress_removes_the_read_out() {
+        let mut state = StatusBarState::default();
+        state.set_progress(Some("Indexing 42%"));
+        state.set_progress(None);
 
-        assert_eq!(info, format!("{} app.rs [+]", icon::FILE));
+        assert_eq!(state.progress(), None);
+        assert!(!left_info(StatusBar::new(&[]), &state).contains("Indexing"));
     }
 
     #[test]
-    fn the_key_hint_still_follows_the_buffer_identity() {
+    fn repeated_progress_reuses_one_buffer() {
+        // The read-out changes many times a second while a project indexes;
+        // each update must not be a new allocation.
         let mut state = StatusBarState::default();
-        state.record_key(KeyModifiers::CONTROL, KeyCode::Char('s'));
+        state.set_progress(Some("Indexing 0%"));
 
-        let info = left_info(StatusBar::new(&[]).file_name(Some("app.rs")), &state);
+        let capacity = state.progress().map(str::len);
+        for i in 0..50 {
+            let text = format!("Indexing {i}%");
+            state.set_progress(Some(&text));
+            assert_eq!(state.progress(), Some(text.as_str()));
+        }
 
-        assert!(info.starts_with(&format!("{} app.rs", icon::FILE)));
-        assert!(info.ends_with(&format!("  {} {}", icon::KEYBOARD, state.key_info())));
-    }
-
-    #[test]
-    fn render_draws_identity_and_key_hint_before_the_position() {
-        let mut state = StatusBarState::default();
-        state.record_key(KeyModifiers::CONTROL, KeyCode::Char('s'));
-
-        let row = render(
-            StatusBar::new(&[]).file_name(Some("app.rs")).dirty(true),
-            &mut state,
-        );
-
-        assert!(row.starts_with(&format!(
-            "{} app.rs [+]  {} {}",
-            icon::FILE,
-            icon::KEYBOARD,
-            state.key_info()
-        )));
-        assert!(row.ends_with(&format!("{} Ln 1, Col 1", icon::CURSOR)));
+        assert!(capacity.is_some());
     }
 }

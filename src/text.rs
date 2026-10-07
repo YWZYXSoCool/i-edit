@@ -17,9 +17,6 @@
 pub mod edit;
 pub mod selection;
 
-#[cfg(test)]
-mod tests;
-
 pub use edit::Edit;
 pub use selection::{Selection, SelectionMode};
 

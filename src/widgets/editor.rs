@@ -25,8 +25,9 @@ use crate::Cursor;
 use crate::action::{Action, Actions};
 use crate::clipboard::{Clipboard, ClipboardBackendKind};
 use crate::component::Component;
-use crate::highlight::{LayerId, StyledRun};
-use crate::text::{Selection, SelectionMode, TextState};
+use crate::highlight::{LayerId, StyledRun, TextEdit};
+use crate::storage::config::TabIndent;
+use crate::text::{Edit, Selection, SelectionMode, TextState};
 use crate::widgets::viewport::gutter_width;
 use crate::widgets::{Viewport, ViewportState};
 
@@ -39,10 +40,6 @@ use unicode_width::UnicodeWidthStr;
 
 use history::History;
 use motion::Motion;
-
-/// Text inserted by the Tab key. Hardcoded to four spaces for now; a later
-/// revision will make the indentation (tabs vs spaces, width) user-configurable.
-const TAB_INDENT: &str = "    ";
 
 /// The text area: a scrolling, multi-line view over a [`TextState`].
 #[derive(Debug, Default)]
@@ -118,11 +115,15 @@ impl Component for Editor {
             if state.selection.is_active() {
                 state.recompute_selection_overlay();
             } else {
+                // Only the overlay is emptied. The coloring switch is left
+                // alone because it is not the selection's to decide: the lower
+                // layers may hold semantic tokens and diagnostic underlines,
+                // and turning it off here would blank them on every cursor
+                // move.
                 state
                     .viewport_state
                     .highlights
                     .clear_layer(LayerId::Overlay);
-                state.viewport_state.highlights.set_enabled(false);
             }
             state.selection_dirty = false;
         }
@@ -217,6 +218,10 @@ pub struct EditorState {
     pub(crate) cursor_screen_pos: Option<Position>,
     /// The active text selection; `mode == None` means no selection.
     selection: Selection,
+    /// What the Tab key inserts. A copy of the `tab_indent` setting, pushed in
+    /// by the shell: a component handling a key sees only its own state, so it
+    /// cannot ask storage what the user chose.
+    pub tab_indent: TabIndent,
     /// Clipboard: mirrors to the system and to an internal register.
     clipboard: Clipboard,
     /// Whether the selection overlay must be recomputed before the next render.
@@ -252,6 +257,12 @@ impl EditorState {
         // A freshly loaded buffer has no coloring yet; rebuild the index to the
         // new line count so stale runs from the previous file cannot leak in.
         self.viewport_state.highlights.reset(self.text.lines.len());
+        // The text was replaced wholesale, so the buffer has moved on: an
+        // in-flight color response was computed against the *old* text and is
+        // now stale, and the language server must be told this version. Without
+        // the bump, reloading a file that had never been edited would look
+        // identical to the server's copy of it.
+        self.version += 1;
         self.path = Some(path);
         self.dirty = false;
         // A new file is a clean slate: drop any history so undo cannot reach
@@ -349,20 +360,20 @@ impl EditorState {
             (_, KeyCode::Char(c)) => {
                 if had_selection {
                     let e = self.text.delete_selection(&self.selection);
-                    self.history.record(e);
+                    self.record(e);
                     self.selection_clear();
                 }
                 let e = self.text.insert_char(c);
-                self.history.record(e);
+                self.record(e);
             }
             (M::NONE, KeyCode::Enter) => {
                 if had_selection {
                     let e = self.text.delete_selection(&self.selection);
-                    self.history.record(e);
+                    self.record(e);
                     self.selection_clear();
                 }
                 let e = self.text.insert_new_line();
-                self.history.record(e);
+                self.record(e);
             }
             (M::NONE, KeyCode::Tab) => {
                 // Tab inserts indentation instead of moving focus; focus cycling
@@ -370,30 +381,30 @@ impl EditorState {
                 // replaced by the indentation, like any other typed text.
                 if had_selection {
                     let e = self.text.delete_selection(&self.selection);
-                    self.history.record(e);
+                    self.record(e);
                     self.selection_clear();
                 }
-                let e = self.text.insert_str(TAB_INDENT);
-                self.history.record(e);
+                let e = self.text.insert_str(self.tab_indent.text());
+                self.record(e);
             }
             (M::NONE, KeyCode::Backspace) => {
                 if had_selection {
                     let e = self.text.delete_selection(&self.selection);
-                    self.history.record(e);
+                    self.record(e);
                     self.selection_clear();
                 } else {
                     let e = self.text.delete_backward();
-                    self.history.record(e);
+                    self.record(e);
                 }
             }
             (M::NONE, KeyCode::Delete) => {
                 if had_selection {
                     let e = self.text.delete_selection(&self.selection);
-                    self.history.record(e);
+                    self.record(e);
                     self.selection_clear();
                 } else {
                     let e = self.text.delete_forward();
-                    self.history.record(e);
+                    self.record(e);
                 }
             }
             (M::NONE, KeyCode::Esc) => {
@@ -404,7 +415,7 @@ impl EditorState {
         let changed = self.history.end_txn();
 
         if changed {
-            self.after_edit(self.text.cursor.y);
+            self.after_edit();
         } else {
             // An unhandled key (or Esc) leaves the document untouched.
             self.sync();
@@ -424,14 +435,71 @@ impl EditorState {
         }
     }
 
-    /// Records an edit: bumps the version, invalidates the coloring layer, flags
-    /// the selection overlay for recompute and resyncs the view.
-    fn after_edit(&mut self, y: usize) {
+    /// Records an edit on the undo stack and carries the coloring across it.
+    ///
+    /// Every command that changes the buffer hands its [`Edit`] here, which is
+    /// what lets the coloring layer move instead of restart: it sees each
+    /// replacement as it happens, so the runs on screen describe the text that
+    /// is on screen. A key press that replaces a selection records twice — a
+    /// delete and an insert — and two moves in a row are as exact as one.
+    fn record(&mut self, edit: Edit) {
+        let change = text_edit(&edit);
+        self.viewport_state.highlights.apply_edit(&change);
+        self.history.record(edit);
+    }
+
+    /// Bookkeeping after a key press that changed the buffer: the document
+    /// moved on, the selection has to be recomputed and the view resynced.
+    fn after_edit(&mut self) {
         self.dirty = true;
         self.version += 1;
-        self.viewport_state.highlights.note_edit(y);
         self.selection_dirty = true;
         self.sync();
+    }
+
+    /// Paints the whole document with the colors a language server produced.
+    ///
+    /// Semantic tokens go into the [`Semantic`](LayerId::Semantic) layer: above
+    /// the syntax layer, because they know more about the code, and below the
+    /// overlay, because the selection must still win. `rows` covers every line
+    /// of the buffer — a response is always for the whole document, so this is
+    /// a wholesale replace, never a merge.
+    pub(crate) fn set_semantic_tokens(&mut self, rows: &[Vec<StyledRun>]) {
+        self.viewport_state
+            .highlights
+            .replace_layer(LayerId::Semantic, rows);
+        // The switch is global to the coloring layer; a producer that has
+        // something to paint is what turns it on.
+        self.viewport_state.highlights.set_enabled(true);
+    }
+
+    /// Drops the colors a language server produced, e.g. after it went away.
+    ///
+    /// Turning the switch off is left to the caller's judgement: a selection
+    /// may still be painted, and clearing one layer must not blank the other.
+    pub(crate) fn clear_semantic_tokens(&mut self) {
+        self.viewport_state
+            .highlights
+            .clear_layer(LayerId::Semantic);
+    }
+
+    /// Paints the underlines a language server reported.
+    ///
+    /// Diagnostics go into the [`Base`](LayerId::Base) layer — the lowest — and
+    /// that is deliberate, not a compromise: they only ever set an underline
+    /// color, never a foreground, so the semantic layer's colors show through
+    /// them instead of being replaced by them. An empty `rows` clears them,
+    /// which is how a fixed error stops being underlined.
+    pub(crate) fn set_diagnostics(&mut self, rows: &[Vec<StyledRun>]) {
+        self.viewport_state
+            .highlights
+            .replace_layer(LayerId::Base, rows);
+        self.viewport_state.highlights.set_enabled(true);
+    }
+
+    /// Drops the underlines a language server reported.
+    pub(crate) fn clear_diagnostics(&mut self) {
+        self.viewport_state.highlights.clear_layer(LayerId::Base);
     }
 
     /// Records a pure movement / selection extension. The document is unchanged,
@@ -446,8 +514,12 @@ impl EditorState {
         let Some(entry) = self.history.begin_undo() else {
             return;
         };
+        // Undoing runs the recorded replacement backwards, so that is the
+        // direction the coloring moves too.
+        let undone = text_edit(&entry.edit).inverse();
         entry.edit.undo(&mut self.text);
         self.history.finish_undo(entry);
+        self.viewport_state.highlights.apply_edit(&undone);
         self.after_history();
     }
 
@@ -456,18 +528,18 @@ impl EditorState {
         let Some(entry) = self.history.begin_redo() else {
             return;
         };
+        let redone = text_edit(&entry.edit);
         entry.edit.redo(&mut self.text);
         self.history.finish_redo(entry);
+        self.viewport_state.highlights.apply_edit(&redone);
         self.after_history();
     }
 
-    /// Bookkeeping shared by `undo`/`redo`: the document changed, so the cached
-    /// coloring and the view refresh, the selection collapses, and `dirty` is
-    /// recomputed against the last write — undoing back onto the saved state
-    /// clears it again.
+    /// Bookkeeping shared by `undo`/`redo`: the document changed, so the view
+    /// refreshes, the selection collapses, and `dirty` is recomputed against
+    /// the last write — undoing back onto the saved state clears it again.
     fn after_history(&mut self) {
         self.version += 1;
-        self.viewport_state.highlights.note_edit(self.text.cursor.y);
         self.selection_clear();
         self.dirty = self.history.is_dirty();
         self.sync();
@@ -487,7 +559,7 @@ impl EditorState {
         self.history.begin_txn();
         if self.selection.is_active() {
             let e = self.text.delete_selection(&self.selection);
-            self.history.record(e);
+            self.record(e);
         } else {
             // No selection: cut the current line (VS Code behaviour). The removed
             // span reaches into the neighbouring newline so the row disappears
@@ -514,12 +586,12 @@ impl EditorState {
                 };
                 self.text.replace(prev, end, "")
             };
-            self.history.record(edit);
+            self.record(edit);
         }
         self.history.end_txn();
         self.text.clamp_cursor();
 
-        self.after_edit(self.text.cursor.y);
+        self.after_edit();
         self.selection_clear();
     }
 
@@ -542,13 +614,13 @@ impl EditorState {
         self.history.begin_txn();
         if self.selection.is_active() {
             let e = self.text.delete_selection(&self.selection);
-            self.history.record(e);
+            self.record(e);
         }
         let e = self.text.insert_str(text);
-        self.history.record(e);
+        self.record(e);
         self.history.end_txn();
 
-        self.after_edit(self.text.cursor.y);
+        self.after_edit();
         self.selection_clear();
     }
 
@@ -653,6 +725,7 @@ impl Default for EditorState {
             path: None,
             dirty: false,
             version: 0,
+            tab_indent: TabIndent::default(),
             viewport_state: ViewportState::default(),
             scrollbar_state: ScrollbarState::default(),
             h_scrollbar_state: ScrollbarState::default(),
@@ -664,6 +737,39 @@ impl Default for EditorState {
             actions: Actions::new(),
             history: History::new(),
         }
+    }
+}
+
+/// The span an [`Edit`] replaced, in the terms the coloring layer speaks.
+///
+/// An [`Edit`] carries the two strings; what the coloring needs is the shape of
+/// the hole they made — which rows it covered, which rows filled it, and how
+/// far the surviving text on the first and last of them slid.
+fn text_edit(edit: &Edit) -> TextEdit {
+    // One newline means two rows are involved: the one the text starts on and
+    // the one it ends on.
+    let rows = |text: &str| text.matches('\n').count() + 1;
+    // Where a side ended on its last row: everything after its final newline,
+    // or — when it never left the first row — however far past `column` it
+    // reached.
+    let end = |text: &str, rows: usize| {
+        if rows == 1 {
+            edit.start.x + text.len()
+        } else {
+            text.rsplit('\n').next().unwrap_or("").len()
+        }
+    };
+
+    let removed_rows = rows(&edit.removed);
+    let inserted_rows = rows(&edit.inserted);
+
+    TextEdit {
+        line: edit.start.y,
+        column: edit.start.x,
+        removed_rows,
+        inserted_rows,
+        removed_to: end(&edit.removed, removed_rows),
+        inserted_to: end(&edit.inserted, inserted_rows),
     }
 }
 

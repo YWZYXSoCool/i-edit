@@ -1,7 +1,7 @@
 //! Dispatching a queued action, and resuming one that had to wait.
 //!
 //! Two of these need a second look at the user before they can run: quitting or
-//! opening a file while the buffer is dirty. Both stash the action in
+//! closing a tab while the buffer is dirty. Both stash the action in
 //! `pending`, ask, and come back through [`App::resolve_confirm`] — which is
 //! why `resolve_confirm` and `resume` live next to the dispatch rather than
 //! with the file operations they eventually trigger.
@@ -28,7 +28,7 @@ impl App {
 
     pub(super) fn open_picker(&mut self, mode: PickerMode) {
         let start_dir = self.picker_start_dir(picker_kind(mode));
-        let preset = self.editor_state.path.clone();
+        let preset = self.tabs.active().path.clone();
         self.popup_state.open_picker(mode, start_dir, preset);
     }
 
@@ -62,7 +62,7 @@ impl App {
         match choice {
             ConfirmChoice::Save => {
                 let continuation = self.pending.take();
-                let path = self.editor_state.path.clone();
+                let path = self.tabs.active().path.clone();
                 self.popup_state.close();
 
                 match path {
@@ -120,6 +120,10 @@ impl App {
             Action::Quit => true,
             Action::LoadFile(path) => {
                 self.load_file_now(path);
+                false
+            }
+            Action::CloseTab => {
+                self.close_active_tab();
                 false
             }
             other => self.apply(other),

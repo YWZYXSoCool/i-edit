@@ -25,7 +25,7 @@ const COMMAND_BOX_TOP: u16 = 2;
 const INPUT_HEIGHT: u16 = 3;
 
 /// Shown in the empty command box.
-const COMMAND_PLACEHOLDER: &str = "type a command…";
+const COMMAND_PLACEHOLDER: &str = "type a command...";
 
 /// [`COMMAND_PLACEHOLDER`] with its icon, built once instead of every frame.
 fn command_placeholder() -> &'static str {
@@ -87,11 +87,14 @@ macro_rules! commands {
 commands! {
     "log" => "open the log panel" => Action::OpenPopup(PopupKind::Log),
     "clear messages" => "clear the notification messages" => Action::ClearMessages,
+    "close folder" => "close the workspace folder and its tabs" => Action::CloseFolder,
     "open file" => "open a file into the editor" => Action::OpenPopup(PopupKind::OpenFile),
     "open folder" => "open a folder into the file tree" => Action::OpenPopup(PopupKind::OpenFolder),
     "quit" => "exit the editor" => Action::Quit,
+    "restart lsp" => "restart the language server" => Action::RestartLsp,
     "save" => "save the current buffer" => Action::Save,
     "save as" => "save the buffer to a new path" => Action::SaveAs,
+    "settings" => "edit the settings file" => Action::OpenSettings,
     "toggle file tree" => "show or hide the file tree" => Action::ToggleFileTree,
 }
 
@@ -401,12 +404,36 @@ mod tests {
     }
 
     #[test]
+    fn restart_lsp_command_reaches_the_shell() {
+        let mut state = open_palette();
+
+        assert_eq!(command(&mut state, "restart lsp"), vec![Action::RestartLsp]);
+    }
+
+    #[test]
     fn clear_messages_command_reaches_the_shell() {
         let mut state = open_palette();
 
         assert_eq!(
             command(&mut state, "clear messages"),
             vec![Action::ClearMessages]
+        );
+    }
+
+    #[test]
+    fn settings_command_opens_the_settings_file() {
+        let mut state = open_palette();
+
+        assert_eq!(command(&mut state, "settings"), vec![Action::OpenSettings]);
+    }
+
+    #[test]
+    fn close_folder_command_reaches_the_shell() {
+        let mut state = open_palette();
+
+        assert_eq!(
+            command(&mut state, "close folder"),
+            vec![Action::CloseFolder]
         );
     }
 

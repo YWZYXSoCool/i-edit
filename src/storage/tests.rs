@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use super::paths::ENV_ROOT;
 use super::{Cache, Section, Storage};
 use crate::fs::DirEntry;
+use crate::storage::config::TabIndent;
 
 /// A unique directory that deletes itself, so tests run in parallel and leave
 /// nothing behind even when they panic.
@@ -296,4 +297,48 @@ fn section_paths_stay_where_the_module_doc_says() {
     assert_eq!(Section::State.relative_path(), "state");
     assert_eq!(Section::Session.relative_path(), "session");
     assert_eq!(Section::Cache.relative_path(), "cache/dirs");
+}
+
+#[test]
+fn the_settings_file_appears_with_its_defaults_and_explains_itself() {
+    let dir = TempDir::new();
+    let mut storage = Storage::open(dir.path().to_path_buf());
+
+    let path = storage.ensure_settings_file().expect("no storage root");
+    assert_eq!(path, dir.path().join("config"));
+    assert!(storage.is_settings_file(&path));
+
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("tab_indent = spaces"));
+    // The file is meant to be edited by hand, so it has to say what it takes.
+    assert!(contents.contains("# tab_indent = spaces | tab"));
+
+    // A second call is what happens on every `settings` command: the file is
+    // already there and the user's edits must survive it.
+    fs::write(&path, "tab_indent = tab\n").unwrap();
+    storage.ensure_settings_file();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "tab_indent = tab\n");
+}
+
+#[test]
+fn rereading_the_settings_takes_the_hand_edit() {
+    let dir = TempDir::new();
+    let mut storage = Storage::open(dir.path().to_path_buf());
+    let path = storage.ensure_settings_file().expect("no storage root");
+
+    assert_eq!(storage.config().tab_indent, TabIndent::Spaces);
+
+    fs::write(&path, "tab_indent = tab\n").unwrap();
+    storage.reload_config();
+
+    assert_eq!(storage.config().tab_indent, TabIndent::Tab);
+    assert!(!storage.is_dirty());
+}
+
+#[test]
+fn without_a_root_there_is_no_settings_file_to_open() {
+    let mut storage = Storage::default();
+
+    assert!(storage.ensure_settings_file().is_none());
+    assert!(!storage.is_settings_file(Path::new("config")));
 }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::action::{Action, Actions};
 use crate::component::Component;
-use crate::fs::{DirEntry, list_dir};
+use crate::fs::{DirEntry, is_hidden_name, list_dir};
 use crate::icon;
 
 use crossterm::event::{Event, KeyCode};
@@ -41,6 +41,10 @@ pub(crate) struct Row {
     path: PathBuf,
     name: String,
     is_dir: bool,
+    /// Whether the row is drawn dim: its own name is a dotfile, or it sits
+    /// inside a hidden directory — everything under a hidden directory is
+    /// hidden along with it, so opening `.git` dims the whole subtree rather
+    /// than only the entries that happen to start with a dot.
     is_hidden: bool,
     depth: usize,
     expanded: bool,
@@ -95,6 +99,24 @@ impl FileTreeState {
         self.selected = 0;
         self.scroll = 0;
         self.set_expanded(&root, true);
+    }
+
+    /// Forgets the root and everything loaded for it.
+    ///
+    /// The counterpart of [`Self::open_root`]: the cache, the rows, the
+    /// selection and the scroll all belonged to the tree that was open. The
+    /// panel itself stays — with no root it renders its "no folder" hint, which
+    /// is where the command to open one is advertised.
+    pub fn close_root(&mut self) {
+        self.root = None;
+        self.dirs.clear();
+        self.rows.clear();
+        self.selected = 0;
+        self.scroll = 0;
+        // Expansion changes are reported to the shell, which drops the
+        // remembered set along with the folder: keeping them would only write
+        // paths from a tree that no longer exists.
+        self.expansion_changes.clear();
     }
 
     /// The root currently shown, if any.
@@ -278,6 +300,12 @@ impl FileTreeState {
     /// by the user's expansions rather than by the file system: nothing is
     /// recursed into until its directory was expanded and read. The vector is
     /// cleared in place, so its capacity is reused across rebuilds.
+    ///
+    /// Hidden-ness is inherited on the way down: a child is dim when its own
+    /// name is a dotfile *or* its parent is hidden. Without that, expanding a
+    /// hidden directory would show its ordinary children at full brightness
+    /// inside a dim parent, which reads as brighter than the folder holding
+    /// them.
     fn rebuild_rows(&mut self) {
         self.rows.clear();
 
@@ -285,11 +313,14 @@ impl FileTreeState {
             return;
         };
 
+        let name = root_name(root);
+        let root_hidden = is_hidden_name(&name);
+
         let mut stack = vec![Row {
             path: root.to_path_buf(),
-            name: root_name(root),
+            name,
             is_dir: true,
-            is_hidden: false,
+            is_hidden: root_hidden,
             depth: 0,
             expanded: false,
         }];
@@ -304,12 +335,14 @@ impl FileTreeState {
                     .and_then(|dir| dir.children.as_ref())
             {
                 let child_depth = row.depth + 1;
+                let parent_hidden = row.is_hidden;
                 // Reverse so the first child comes off the stack first.
                 stack.extend(children.iter().rev().map(|child| Row {
                     path: child.path.clone(),
                     name: child.name.clone(),
                     is_dir: child.is_dir,
-                    is_hidden: child.is_hidden,
+                    // Inherited: a hidden directory hides its whole subtree.
+                    is_hidden: child.is_hidden || parent_hidden,
                     depth: child_depth,
                     expanded: false,
                 }));
@@ -495,9 +528,140 @@ fn render_row(row: &Row, area: Rect, selected: bool, buf: &mut Buffer) {
 
 /// Name shown for the root row. A drive or share root has no file name, so it
 /// falls back to the full display path instead of an empty label.
-fn root_name(root: &Path) -> String {
+///
+/// Visible to the shell so it can name the folder it closes in a message.
+pub(crate) fn root_name(root: &Path) -> String {
     root.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| root.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+
+    use super::{FileTree, FileTreeState};
+    use crate::component::Component;
+
+    /// A unique directory that deletes itself, so tests can run in parallel.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "i-edit-tree-test-{}-{}",
+                std::process::id(),
+                unique
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Every drawn row as `(text, dim)`: the text so a test can say which
+    /// entry it means, and whether that entry was drawn in the dim tone.
+    fn rows(buf: &Buffer, area: Rect) -> Vec<(String, bool)> {
+        (area.y..area.bottom())
+            .map(|y| {
+                let text: String = (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+
+                // The left border is skipped: it is dim on every row.
+                let dim = (area.x.saturating_add(1)..area.right()).find_map(|x| {
+                    let cell = &buf[(x, y)];
+                    (!cell.symbol().trim().is_empty()).then_some(cell.fg)
+                }) == Some(Color::DarkGray);
+
+                (text, dim)
+            })
+            .collect()
+    }
+
+    /// Whether the row naming `entry` was drawn dim.
+    fn is_dim(drawn: &[(String, bool)], entry: &str) -> bool {
+        let row = drawn
+            .iter()
+            .find(|(text, _)| text.contains(entry))
+            .unwrap_or_else(|| panic!("no row for {entry}: {drawn:?}"));
+        row.1
+    }
+
+    /// Fills `dir` with a hidden subdirectory holding a hidden file, plus a
+    /// hidden file and an ordinary file of its own.
+    fn fill(dir: &Path) {
+        fs::create_dir_all(dir.join(".deeper")).unwrap();
+        fs::write(dir.join(".deeper").join(".nested.txt"), "x").unwrap();
+        fs::write(dir.join(".secret"), "x").unwrap();
+        fs::write(dir.join("plain.txt"), "x").unwrap();
+    }
+
+    #[test]
+    fn a_hidden_directory_dims_its_whole_subtree() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        fill(&root.join(".hidden"));
+        fs::write(root.join("visible.txt"), "x").unwrap();
+
+        let mut state = FileTreeState::new();
+        state.open_root(root.to_path_buf());
+        state.set_expanded(&root.join(".hidden"), true);
+        state.set_expanded(&root.join(".hidden").join(".deeper"), true);
+
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buf = Buffer::empty(area);
+        Component::render(FileTree, area, &mut buf, &mut state);
+        let drawn = rows(&buf, area);
+
+        // Hidden by name...
+        assert!(is_dim(&drawn, ".hidden"));
+        assert!(is_dim(&drawn, ".deeper"));
+        assert!(is_dim(&drawn, ".nested.txt"));
+        assert!(is_dim(&drawn, ".secret"));
+        // ...and hidden by living inside a hidden directory.
+        assert!(is_dim(&drawn, "plain.txt"));
+
+        // The visible root keeps its full brightness.
+        assert!(!is_dim(&drawn, "visible.txt"));
+        assert!(!drawn[0].1, "root row is dim: {:?}", drawn[0].0);
+    }
+
+    #[test]
+    fn a_hidden_root_dims_the_tree_it_opens() {
+        let dir = TempDir::new();
+        let hidden_root = dir.path().join(".hidden");
+        fill(&hidden_root);
+
+        let mut state = FileTreeState::new();
+        state.open_root(hidden_root.clone());
+
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buf = Buffer::empty(area);
+        Component::render(FileTree, area, &mut buf, &mut state);
+        let drawn = rows(&buf, area);
+
+        assert!(is_dim(&drawn, ".deeper"));
+        assert!(is_dim(&drawn, ".secret"));
+        assert!(is_dim(&drawn, "plain.txt"));
+    }
 }

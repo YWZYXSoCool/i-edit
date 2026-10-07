@@ -18,33 +18,39 @@
 //! | ----------- | ------------------------------------------------------ |
 //! | `session`   | what the last run was looking at, and where to pick up  |
 //! | `files`     | opening, saving, overwriting and the confirms around it |
+//! | `settings`  | the settings file: opening it, and applying what it says |
 //! | `actions`   | how a queued [`Action`] is dispatched, and resumed      |
+//! | `tabs`      | which buffers are open, and which one is current        |
 //! | `render`    | the layout                                             |
 
 mod actions;
 mod files;
 mod render;
 mod session;
+mod settings;
+mod tabs;
 
 #[cfg(test)]
 mod tests;
+
+use tabs::Tabs;
 
 use std::path::PathBuf;
 
 use crate::Result;
 use crate::action::Action;
 use crate::component::Component;
+use crate::lsp::{LspClient, LspEvent};
 use crate::shortcuts;
 use crate::storage::Storage;
 use crate::utils;
 use crate::widgets::picker::PickerMode;
-use crate::widgets::popup::PopupKind;
+use crate::widgets::popup::{ConfirmKind, PopupKind};
 use crate::widgets::{
-    Editor, EditorState, FileTree, FileTreeState, MessageBoxState, Popup, PopupState, StatusBar,
-    StatusBarState,
+    Editor, FileTree, FileTreeState, MessageBoxState, Popup, PopupState, StatusBar, StatusBarState,
 };
 
-use crossterm::event;
+use crossterm::event::{self};
 use log::{debug, info};
 use ratatui::DefaultTerminal;
 
@@ -58,7 +64,7 @@ pub enum Focus {
 
 pub struct App {
     storage: Storage,
-    editor_state: EditorState,
+    tabs: Tabs,
     popup_state: PopupState,
     status_bar_state: StatusBarState,
     message_box_state: MessageBoxState,
@@ -76,6 +82,10 @@ pub struct App {
     /// changed (an event, or data arriving on the async intake) instead of
     /// blocking on `event::read`, which would starve asynchronous producers.
     needs_redraw: bool,
+    /// The language server, if one is running. Its only appearance in the shell
+    /// is here: everything it does is pulled by [`Self::drain_incoming`], so
+    /// the server can be slow, absent or dead without the loop knowing.
+    lsp: LspClient,
 }
 
 impl App {
@@ -90,19 +100,71 @@ impl App {
     /// iterations per second, and a no-op draw is skipped entirely.
     const POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-    /// Pulls pending data from asynchronous sources (a future LSP client, file
-    /// watchers). Today it is a placeholder: the position is taken so the render
-    /// loop already has an intake seam, and any data that arrives there will
-    /// mark `needs_redraw`.
+    /// Pulls pending data from asynchronous sources — today, the language
+    /// server.
+    ///
+    /// Called at the top of every loop iteration and never blocking: whatever
+    /// has arrived is applied, whatever has not is left for the next frame. The
+    /// version is read once so a whole batch is judged against the same buffer.
     fn drain_incoming(&mut self) {
-        // Intentionally empty: see `Self::POLL` and the module docs.
+        let version = self.tabs.active().version;
+
+        while let Some(event) = self.lsp.tick(&self.tabs.active().text.lines, version) {
+            self.apply_lsp_event(event);
+        }
+    }
+
+    /// Applies one language-server event.
+    fn apply_lsp_event(&mut self, event: LspEvent) {
+        match event {
+            LspEvent::Tokens { version } => {
+                // Offsets describe the text as it was when the request went
+                // out. Against a buffer that has moved on they would slice the
+                // wrong characters, so the batch is dropped instead of guessed
+                // at — the next sync asks again.
+                if version == self.tabs.active().version {
+                    let rows = self.lsp.rows();
+                    self.tabs.active_mut().set_semantic_tokens(rows);
+                }
+                self.needs_redraw = true;
+            }
+            LspEvent::Diagnostics => {
+                self.tabs
+                    .active_mut()
+                    .set_diagnostics(self.lsp.diagnostic_rows());
+                self.needs_redraw = true;
+            }
+            LspEvent::Progress => {
+                // Copied out of the client rather than borrowed: the status bar
+                // keeps its own text, so the read-out survives until the next
+                // progress notification — or the `end` that clears it.
+                let text = self.lsp.progress_text();
+                self.status_bar_state.set_progress(text.as_deref());
+                self.needs_redraw = true;
+            }
+            LspEvent::Notice(text) => {
+                // Worth knowing, costs nothing to ignore: the coloring layer is
+                // left exactly as it is.
+                self.message_box_state.info(text);
+                self.needs_redraw = true;
+            }
+            LspEvent::Stopped(reason) => {
+                // The server is decoration: losing it costs colors and nothing
+                // else, and it is reported once rather than per keystroke.
+                self.tabs.active_mut().clear_semantic_tokens();
+                self.tabs.active_mut().clear_diagnostics();
+                self.status_bar_state.set_progress(None);
+                self.message_box_state.warning(reason);
+                self.needs_redraw = true;
+            }
+        }
     }
 
     /// An editor whose session comes from `storage` and is written back to it.
     pub fn new(storage: Storage) -> Self {
-        Self {
+        let mut app = Self {
             storage,
-            editor_state: EditorState::new(),
+            tabs: Tabs::new(),
             popup_state: PopupState::new(),
             status_bar_state: StatusBarState::new(),
             message_box_state: MessageBoxState::new(),
@@ -114,7 +176,13 @@ impl App {
             actions_buf: Vec::new(),
             expansion_buf: Vec::new(),
             needs_redraw: true,
-        }
+            lsp: LspClient::new(),
+        };
+
+        // The settings are on disk before the first frame; everything that
+        // reads them starts off with the stored value rather than a default.
+        app.apply_settings();
+        app
     }
 }
 
@@ -154,7 +222,7 @@ impl App {
             // editor when it is the focused component and no popup is open.
             if let event::Event::Paste(_) = &event {
                 if self.focus == Focus::Editor && self.popup_state.kind.is_none() {
-                    Component::handle_event(Editor, &event, &mut self.editor_state);
+                    Component::handle_event(Editor, &event, self.tabs.active_mut());
                     self.needs_redraw = true;
                 }
                 continue;
@@ -165,7 +233,7 @@ impl App {
             };
 
             Component::handle_event(
-                StatusBar::new(&self.editor_state.text.lines),
+                StatusBar::new(&self.tabs.active().text.lines),
                 &event,
                 &mut self.status_bar_state,
             );
@@ -177,22 +245,17 @@ impl App {
                     quit = self.apply(action);
                 } else if key.code == shortcuts::QUIT_KEY {
                     // Esc priority: close popup (handled above) > leave the
-                    // tree > quit the editor (with its own dirty check).
-                    if self.focus == Focus::FileTree {
-                        self.set_focus(Focus::Editor);
-                    } else {
-                        quit = self.apply(Action::Quit);
+                    // tree or tab bar > quit the editor (with its own dirty check).
+                    match self.focus {
+                        Focus::FileTree => self.set_focus(Focus::Editor),
+                        Focus::Editor => quit = self.apply(Action::Quit),
                     }
-                } else if shortcuts::is_focus_key(key) && self.file_tree_visible {
-                    let focus = match self.focus {
-                        Focus::Editor => Focus::FileTree,
-                        Focus::FileTree => Focus::Editor,
-                    };
-                    self.set_focus(focus);
+                } else if shortcuts::is_focus_key(key) {
+                    self.cycle_focus();
                 } else if self.focus == Focus::FileTree {
                     Component::handle_event(FileTree, &event, &mut self.file_tree_state);
                 } else {
-                    Component::handle_event(Editor, &event, &mut self.editor_state);
+                    Component::handle_event(Editor, &event, self.tabs.active_mut());
                 }
             } else {
                 Component::handle_event(Popup, &event, &mut self.popup_state);
@@ -201,6 +264,10 @@ impl App {
             // Components cannot touch anything outside their own state, so they
             // queue requests instead. The shell is the only one applying them.
             if quit || self.apply_actions() {
+                // Stopped here rather than in `Drop`: this is the one place
+                // that knows the loop is about to end, so the server's threads
+                // are joined while the terminal still belongs to us.
+                self.lsp.shutdown();
                 // Last chance to record where the buffer was left: writing
                 // only on a switch would lose the position of the file being
                 // quit from.
@@ -223,9 +290,127 @@ impl App {
         self.focus = focus;
     }
 
-    /// Writes the session back to disk. Call this after the editor has run:
-    /// a failed save is worth reporting, but never worth blocking exit over.
+    /// Step the focus on by one panel: editor -> file tree -> editor.
+    ///
+    /// The file tree only joins the rotation while it is visible, because
+    /// focusing a panel nobody can see would swallow keystrokes with nothing
+    /// on screen to explain it; with the panel hidden the key is a no-op that
+    /// leaves the editor in charge.
+    pub(super) fn cycle_focus(&mut self) {
+        let next = match self.focus {
+            Focus::Editor if self.file_tree_visible => Focus::FileTree,
+            // Nothing to step onto with the panel hidden, and a focus that is
+            // already on a hidden tree has nowhere to go but back.
+            _ => Focus::Editor,
+        };
+        self.set_focus(next);
+    }
+
+    /// Handles a key pressed while the tab bar has the focus.
+    ///
+    /// The arrows (and their vim spelling) step through the tabs and the
+    /// editor follows along immediately, so browsing to the right file is a
+    /// matter of holding one key; Enter hands the keys back to the buffer.
+    /// Makes tab `i` active, leaving the focus wherever it is.
+    /// Moves the active tab `delta` places, wrapping around the ends.
+    /// Points the editor at tab `i`.
+    ///
+    /// The outgoing buffer records where it was left first, so stepping past a
+    /// file and stepping back returns to the same line.
+    fn switch_to_tab(&mut self, i: usize) {
+        self.remember_current_view();
+        self.tabs.set_active(i);
+        self.after_tab_change();
+    }
+
+    /// Closes the active tab, asking first when it holds unsaved changes.
+    ///
+    /// Every tab can be closed, the last one included: what is left behind is
+    /// a fresh scratch buffer, so the editor never has nothing to edit.
+    ///
+    /// A dirty *scratch* buffer is dropped silently — see
+    /// [`Self::request_quit`] — because there is no path to save it to.
+    pub(super) fn request_close_tab(&mut self) {
+        let needs_confirm = self.tabs.active().dirty && self.tabs.active().path.is_some();
+        if needs_confirm {
+            self.pending = Some(Action::CloseTab);
+            self.popup_state.open_confirm(ConfirmKind::UnsavedChanges);
+            return;
+        }
+        self.close_active_tab();
+    }
+
+    /// Removes the active tab and follows whatever becomes active instead —
+    /// a scratch buffer when the tab that went was the last one.
+    pub(super) fn close_active_tab(&mut self) {
+        let closed = self.tabs.active().path.clone();
+        self.tabs.close_active();
+
+        // The buffer is gone, so the document it was showing is gone with it:
+        // the server is told to drop it instead of holding one no switch can
+        // ever ask for again.
+        if let Some(path) = closed {
+            self.lsp.forget(&path);
+        }
+
+        // The tree may have been focused when the shortcut was pressed, but
+        // the panel that asked for this is gone: keys belong to the editor.
+        self.set_focus(Focus::Editor);
+        self.after_tab_change();
+    }
+
+    /// Everything that follows the active buffer becoming another one.
+    ///
+    /// The language server is told which file is on screen — it holds every
+    /// document it was given, so this is a lookup for a tab that has been
+    /// looked at before, not a reopen; the session is told too, so a restart
+    /// opens the file that was last looked at rather than the one that was
+    /// last opened.
+    fn after_tab_change(&mut self) {
+        let current = self.tabs.active().path.clone();
+
+        // The settings file is not a document being worked on, so it must not
+        // become the file the next run comes back to.
+        if !current
+            .as_deref()
+            .is_some_and(|path| self.storage.is_settings_file(path))
+        {
+            self.storage
+                .edit_session(|session| session.last_file = current);
+        }
+        self.remember_tabs();
+        self.sync_lsp();
+        self.needs_redraw = true;
+    }
+
+    /// Records which buffers are open, and in what order.
+    ///
+    /// The tab bar is the one piece of session state the editor cannot
+    /// reconstruct on its own — a file that is open is only known here — so
+    /// it is written whenever the set changes, which is also what lets a
+    /// crash mid-run still leave the last known bar behind. Scratch buffers
+    /// have no path and are left out: they cannot be read back.
+    fn remember_tabs(&mut self) {
+        let open: Vec<PathBuf> = self
+            .tabs
+            .buffers()
+            .iter()
+            .filter_map(|buffer| buffer.path.clone())
+            .collect();
+
+        self.storage.edit_session(|session| session.set_tabs(open));
+    }
+
+    /// Writes the session back to disk, recording where the run ended first.
+    ///
+    /// The cursor and the tab bar are captured here as well as on the way:
+    /// the file being quit from is the one whose position no switch ever
+    /// recorded, and a tab opened as the last act of the run is the one no
+    /// later change would have saved. Call this after the editor has run: a
+    /// failed save is worth reporting, but never worth blocking exit over.
     pub fn persist(&mut self) -> Result<()> {
+        self.remember_current_view();
+        self.remember_tabs();
         self.storage.flush()
     }
 
@@ -234,7 +419,9 @@ impl App {
     /// Returns `true` once quitting has been requested.
     pub(super) fn apply_actions(&mut self) -> bool {
         self.actions_buf.clear();
-        self.editor_state.take_actions_into(&mut self.actions_buf);
+        self.tabs
+            .active_mut()
+            .take_actions_into(&mut self.actions_buf);
         self.popup_state.take_actions_into(&mut self.actions_buf);
         self.file_tree_state
             .take_actions_into(&mut self.actions_buf);
@@ -280,6 +467,10 @@ impl App {
                 self.open_folder(path);
                 false
             }
+            Action::CloseFolder => {
+                self.close_folder();
+                false
+            }
             Action::Save => {
                 self.save_current();
                 false
@@ -289,6 +480,10 @@ impl App {
                 false
             }
             Action::SaveTo(path) => self.save_to(path),
+            Action::OpenSettings => {
+                self.open_settings();
+                false
+            }
             Action::ToggleFileTree => {
                 self.toggle_file_tree();
                 false
@@ -297,8 +492,45 @@ impl App {
                 self.message_box_state.clear();
                 false
             }
+            Action::RestartLsp => {
+                self.restart_lsp();
+                false
+            }
+            Action::CloseTab => {
+                self.request_close_tab();
+                false
+            }
             Action::ConfirmChoice(choice) => self.resolve_confirm(choice),
+
+            Action::NextTab => {
+                self.next_tab();
+                false
+            }
+            Action::PrevTab => {
+                self.prev_tab();
+                false
+            }
         }
+    }
+
+    fn next_tab(&mut self) {
+        self.step_tab(1);
+    }
+
+    fn prev_tab(&mut self) {
+        self.step_tab(-1);
+    }
+
+    /// Steps the active tab `delta` places, wrapping around the ends.
+    ///
+    /// Goes through the same bookkeeping as [`Self::switch_to_tab`], which
+    /// stepping used to skip: without it the buffer being left never records
+    /// its cursor, the session is never told which tab is current, and the
+    /// language server goes on coloring the file that was just left.
+    fn step_tab(&mut self, delta: isize) {
+        self.remember_current_view();
+        self.tabs.move_active_by(delta);
+        self.after_tab_change();
     }
 
     /// Integration-test entry point for a single action; not part of the public API.

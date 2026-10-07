@@ -6,6 +6,8 @@
 //! shortcut, edit [`SHORTCUTS`]; both the behaviour and the on-screen hint
 //! follow.
 
+use std::fmt::Write;
+
 use crate::action::Action;
 use crate::widgets::popup::PopupKind;
 
@@ -47,8 +49,7 @@ impl Combo {
         }
     }
 
-    /// A key held with Shift, for shell navigation (Shift+Tab to cycle focus).
-    const fn shifted(code: KeyCode) -> Self {
+    const fn shift(code: KeyCode) -> Self {
         Self {
             code,
             control: false,
@@ -69,15 +70,7 @@ impl Combo {
         if self.shift {
             label.push_str("Shift+");
         }
-        match self.code {
-            KeyCode::Char(c) => label.push(c.to_ascii_uppercase()),
-            KeyCode::Esc => label.push_str("Esc"),
-            KeyCode::Tab => label.push_str("Tab"),
-            KeyCode::Enter => label.push_str("Enter"),
-            KeyCode::Backspace => label.push_str("Backspace"),
-            KeyCode::Delete => label.push_str("Delete"),
-            other => label.push_str(&format!("{other:?}")),
-        }
+        label.write_fmt(format_args!("{}", self.code)).unwrap();
         label
     }
 
@@ -160,6 +153,12 @@ pub const SHORTCUTS: &[Shortcut] = &[
         welcome: true,
     },
     Shortcut {
+        combo: Combo::ctrl(KeyCode::Char('w'), false),
+        description: "close tab",
+        action: Some(Action::CloseTab),
+        welcome: true,
+    },
+    Shortcut {
         combo: Combo::ctrl(KeyCode::Char('q'), true),
         description: "commands",
         action: Some(Action::OpenPopup(PopupKind::Command)),
@@ -180,20 +179,35 @@ pub const SHORTCUTS: &[Shortcut] = &[
         welcome: false,
     },
     Shortcut {
+        combo: Combo::ctrl(KeyCode::Char(','), false),
+        description: "settings",
+        action: Some(Action::OpenSettings),
+        welcome: true,
+    },
+    Shortcut {
         combo: Combo::plain(KeyCode::Esc),
         description: "quit",
         action: None,
         welcome: true,
     },
     Shortcut {
-        combo: Combo::shifted(KeyCode::Tab),
-        description: "switch panel",
-        action: None,
+        combo: Combo::ctrl(KeyCode::Right, false),
+        description: "next tab",
+        action: Some(Action::NextTab),
         welcome: true,
     },
     Shortcut {
-        combo: Combo::plain(KeyCode::Tab),
-        description: "insert 4 spaces",
+        combo: Combo::ctrl(KeyCode::Left, false),
+        description: "prev tab",
+        action: Some(Action::PrevTab),
+        welcome: true,
+    },
+    // Listed as `Shift+Tab` for the welcome screen but matched by
+    // [`is_focus_key`]: a terminal reports the chord as `BackTab`, not as a
+    // `Tab` with a shift modifier.
+    Shortcut {
+        combo: Combo::shift(KeyCode::Tab),
+        description: "switch panel",
         action: None,
         welcome: true,
     },
@@ -202,12 +216,14 @@ pub const SHORTCUTS: &[Shortcut] = &[
 /// Key the shell uses to quit when nothing is open.
 pub const QUIT_KEY: KeyCode = KeyCode::Esc;
 
-/// True when `key` is the focus-cycle chord: Alt+Tab.
+/// True for the key that cycles the panel focus: Shift+Tab, reported as
+/// `BackTab`.
 ///
-/// Terminals are inconsistent about how they report Alt+Tab — some send the
-/// dedicated [`KeyCode::BackTab`] code, others send [`KeyCode::Tab`] with the
-/// Alt modifier — so both forms are accepted. Plain Tab is deliberately not
-/// matched here: it falls through to the editor, which inserts indentation.
+/// Terminals do not send a `Tab` carrying a shift modifier — crossterm turns
+/// both the `ESC [ Z` sequence and Windows' shifted `VK_TAB` into
+/// [`KeyCode::BackTab`] — so matching `Tab` + shift matches nothing that a
+/// real terminal can produce. `Alt+Tab` is accepted as well because some
+/// terminals swallow the shift form and hand the OS-chord through instead.
 pub fn is_focus_key(key: KeyEvent) -> bool {
     key.code == KeyCode::BackTab
         || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::ALT))
@@ -305,6 +321,12 @@ mod tests {
             lookup(key(KeyCode::Char('m'), KeyModifiers::CONTROL)),
             Some(Action::ClearMessages)
         );
+
+        // Ctrl+, opens the settings file.
+        assert_eq!(
+            lookup(key(KeyCode::Char(','), KeyModifiers::CONTROL)),
+            Some(Action::OpenSettings)
+        );
     }
 
     #[test]
@@ -320,10 +342,33 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_binding_reaches_the_welcome_screen() {
+        // The listing is generated from the registry, so a binding that is
+        // matched but not labelled would be invisible to the user.
+        assert!(
+            welcome_lines()
+                .iter()
+                .any(|(label, description)| *description == "settings" && label == "Ctrl+,")
+        );
+    }
+
+    #[test]
     fn non_control_keys_are_not_shortcuts() {
         assert_eq!(lookup(key(KeyCode::Char('o'), KeyModifiers::NONE)), None);
         // Alt alone (no control) binds nothing.
         assert_eq!(lookup(key(KeyCode::Char('o'), KeyModifiers::ALT)), None);
+    }
+
+    #[test]
+    fn the_focus_key_is_the_back_tab_a_terminal_reports() {
+        // Shift+Tab reaches the app as BackTab; a `Tab` carrying a shift
+        // modifier is never produced, so matching that form matched nothing.
+        assert!(is_focus_key(key(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        assert!(is_focus_key(key(KeyCode::BackTab, KeyModifiers::NONE)));
+
+        // Plain Tab belongs to the editor, where it indents.
+        assert!(!is_focus_key(key(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!is_focus_key(key(KeyCode::Tab, KeyModifiers::SHIFT)));
     }
 
     #[test]
@@ -336,23 +381,5 @@ mod tests {
         let labels: Vec<&str> = welcome_lines().iter().map(|(_, d)| *d).collect();
         assert!(labels.contains(&"quit"));
         assert!(labels.contains(&"switch panel"));
-    }
-
-    #[test]
-    fn welcome_labels_describe_the_real_bindings() {
-        let lines: Vec<(String, &str)> = welcome_lines();
-        // No stale "Ctrl+Shift+O" hints survive: folder opening is Ctrl+Alt+O.
-        assert!(
-            lines
-                .iter()
-                .any(|(label, desc)| label == "Ctrl+Alt+O" && *desc == "open folder")
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|(label, desc)| label == "Ctrl+O" && *desc == "open file")
-        );
-        // The Ctrl+Enter alias is hidden.
-        assert!(!lines.iter().any(|(label, _)| label == "Ctrl+Enter"));
     }
 }

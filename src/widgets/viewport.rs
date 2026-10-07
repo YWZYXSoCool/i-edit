@@ -1,10 +1,10 @@
 use core::fmt::Write;
 
 use crate::fixed_buf::FixedBuf;
-use crate::highlight::{Highlights, StyledRun};
+use crate::highlight::{Highlights, LAYER_COUNT, StyledRun};
 use crate::utils;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::StatefulWidget;
 use unicode_width::UnicodeWidthChar;
 
@@ -110,39 +110,33 @@ impl StatefulWidget for Viewport<'_> {
             // Coloring is pulled per row. When it is off we hand the renderer
             // empty slices, so every text cell keeps the default style — the
             // byte-for-byte output of the pre-coloring editor.
-            let empty: (&[StyledRun], &[StyledRun]) = (&[], &[]);
-            let (base, overlay) = if state.highlights.enabled() {
+            let empty: [&[StyledRun]; LAYER_COUNT] = [&[]; LAYER_COUNT];
+            let layers = if state.highlights.enabled() {
                 state.highlights.line_runs(absolute_y)
             } else {
                 empty
             };
 
-            // Two cursors walk the layers in lockstep with the characters. Each
-            // advances past runs it has moved beyond; `overlay` is consulted
-            // first, then `base`, then the default style. The cursors track byte
-            // positions, never display columns, so horizontal scrolling never
-            // shifts a color off its character.
-            let mut bi = 0usize;
-            let mut oi = 0usize;
+            // One cursor per layer, walking in lockstep with the characters.
+            // Each advances past runs it has moved beyond. The cursors track
+            // byte positions, never display columns, so horizontal scrolling
+            // never shifts a color off its character.
+            let mut cursors = [0usize; LAYER_COUNT];
             let mut col_offset = -(state.scroll_x as i32);
             let mut last_drawn: Option<i32> = None;
 
             for (byte_idx, ch) in line.char_indices() {
                 let char_width = UnicodeWidthChar::width(ch).unwrap_or(0) as i32;
 
-                while bi < base.len() && run_exhausted(&base[bi], byte_idx) {
-                    bi += 1;
-                }
-                while oi < overlay.len() && run_exhausted(&overlay[oi], byte_idx) {
-                    oi += 1;
+                for layer in 0..LAYER_COUNT {
+                    while cursors[layer] < layers[layer].len()
+                        && run_exhausted(&layers[layer][cursors[layer]], byte_idx)
+                    {
+                        cursors[layer] += 1;
+                    }
                 }
 
-                // `overlay` wins, then `base`, then the default style.
-                let style = overlay
-                    .get(oi)
-                    .filter(|r| (r.start as usize) <= byte_idx)
-                    .or_else(|| base.get(bi).filter(|r| (r.start as usize) <= byte_idx))
-                    .map_or(Style::default(), |r| r.style);
+                let style = resolve(layers, cursors, byte_idx);
 
                 if col_offset >= 0 && col_offset + char_width <= text_width {
                     let x = area.x + content_offset_x as u16 + col_offset as u16;
@@ -151,7 +145,7 @@ impl StatefulWidget for Viewport<'_> {
                     let is_whitespace = ch.is_whitespace();
                     let written_char = if is_whitespace { '·' } else { ch };
                     let style = if is_whitespace {
-                        style.fg(Color::DarkGray)
+                        style.add_modifier(Modifier::DIM)
                     } else {
                         style
                     };
@@ -173,7 +167,7 @@ impl StatefulWidget for Viewport<'_> {
             // end, otherwise the highlight snaps off at the last character. Only
             // rows whose trailing run carries a background are touched; plain
             // text pays nothing.
-            if let Some(bg) = trailing_background(base, overlay, line.len()) {
+            if let Some(bg) = trailing_background(layers, line.len()) {
                 let fill_from = match last_drawn {
                     Some(end) => end + 1,
                     // An empty row with a trailing (zero-length) background run
@@ -195,6 +189,54 @@ impl StatefulWidget for Viewport<'_> {
     }
 }
 
+/// The style for one byte: **each attribute comes from the highest-priority
+/// layer that sets it**, not from one winning layer wholesale.
+///
+/// That distinction is the reason the layers can coexist. A diagnostic in the
+/// lowest layer sets only an underline; the semantic layer above it sets only a
+/// foreground; the selection sets only a background. Picking one layer's whole
+/// `Style` would make two of the three invisible. Resolving per attribute lets
+/// all three annotate the same character at once.
+///
+/// Allocation-free: a `Style` and a few comparisons on the stack, per character.
+fn resolve(
+    layers: [&[StyledRun]; LAYER_COUNT],
+    cursors: [usize; LAYER_COUNT],
+    byte_idx: usize,
+) -> Style {
+    let mut style = Style::default();
+
+    // `LAYER_ORDER` is ascending priority, so walk it backwards: the first
+    // layer to set an attribute owns it.
+    for layer in (0..LAYER_COUNT).rev() {
+        let Some(run) = layers[layer]
+            .get(cursors[layer])
+            .filter(|r| (r.start as usize) <= byte_idx)
+        else {
+            continue;
+        };
+
+        // An unset attribute is not "set to default", it is "not claimed" — so
+        // a lower layer may still supply it.
+        if style.fg.is_none() {
+            style.fg = run.style.fg;
+        }
+        if style.bg.is_none() {
+            style.bg = run.style.bg;
+        }
+        if style.underline_color.is_none() {
+            style.underline_color = run.style.underline_color;
+        }
+        // Modifiers are additive across layers on purpose: a comment's italic
+        // and a diagnostic's underline are independent facts about the same
+        // character, and neither cancels the other.
+        style.add_modifier |= run.style.add_modifier;
+        style.sub_modifier |= run.style.sub_modifier;
+    }
+
+    style
+}
+
 /// Whether `run` no longer covers `byte_idx`.
 ///
 /// A normal run `[start, end)` covers `byte_idx` while `byte_idx < end`; once
@@ -214,12 +256,8 @@ fn run_exhausted(run: &StyledRun, byte_idx: usize) -> bool {
 
 /// The style whose background should extend to the visible row end, if a run
 /// reaches the line end (`end == line_len`, or a zero-length run at `line_len`).
-/// `overlay` takes priority over `base`.
-fn trailing_background(
-    base: &[StyledRun],
-    overlay: &[StyledRun],
-    line_len: usize,
-) -> Option<Style> {
+/// Higher-priority layers win, so the search runs from the top layer down.
+fn trailing_background(layers: [&[StyledRun]; LAYER_COUNT], line_len: usize) -> Option<Style> {
     let candidate = |run: &StyledRun| -> Option<Style> {
         let reaches_end = (run.end as usize) == line_len
             || (run.start as usize) == (run.end as usize) && (run.start as usize) == line_len;
@@ -232,14 +270,11 @@ fn trailing_background(
         }
     };
 
-    for run in overlay.iter().rev() {
-        if let Some(style) = candidate(run) {
-            return Some(style);
-        }
-    }
-    for run in base.iter().rev() {
-        if let Some(style) = candidate(run) {
-            return Some(style);
+    for layer in (0..LAYER_COUNT).rev() {
+        for run in layers[layer].iter().rev() {
+            if let Some(style) = candidate(run) {
+                return Some(style);
+            }
         }
     }
     None
@@ -355,6 +390,88 @@ mod tests {
         assert_eq!(buf[(content, 0)].fg, Color::Blue);
         // Base shows through where overlay does not → 'b' Red.
         assert_eq!(buf[(content + 1, 0)].fg, Color::Red);
+    }
+
+    /// The three layers, resolved in one pass: each producer gets its own
+    /// color where it covers a byte, and the higher-priority one wins.
+    #[test]
+    fn semantic_beats_syntax_and_overlay_beats_semantic() {
+        let lines = vec![String::from("abcdef")];
+        let mut state = ViewportState::default();
+        // Syntax covers the whole line; semantic and overlay cover narrower
+        // prefixes, so all three are visible in one row.
+        state
+            .highlights
+            .replace_layer(LayerId::Base, &[vec![run_at(0, 6, Color::Red)]]);
+        state
+            .highlights
+            .replace_layer(LayerId::Semantic, &[vec![run_at(0, 4, Color::Green)]]);
+        state
+            .highlights
+            .replace_layer(LayerId::Overlay, &[vec![run_at(0, 2, Color::Blue)]]);
+        state.highlights.set_enabled(true);
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        assert_eq!(buf[(content, 0)].fg, Color::Blue); // 'a': overlay
+        assert_eq!(buf[(content + 1, 0)].fg, Color::Blue); // 'b': overlay
+        assert_eq!(buf[(content + 2, 0)].fg, Color::Green); // 'c': semantic
+        assert_eq!(buf[(content + 3, 0)].fg, Color::Green); // 'd': semantic
+        assert_eq!(buf[(content + 4, 0)].fg, Color::Red); // 'e': syntax
+        assert_eq!(buf[(content + 5, 0)].fg, Color::Red); // 'f': syntax
+    }
+
+    /// The gap between an edit and the server's answer is why the syntax layer
+    /// exists: with only the semantic layer covering a byte, the rest is plain.
+    #[test]
+    fn uncovered_bytes_fall_through_to_the_default() {
+        let lines = vec![String::from("abcdef")];
+        let mut state = ViewportState::default();
+        state
+            .highlights
+            .replace_layer(LayerId::Semantic, &[vec![run_at(2, 4, Color::Green)]]);
+        state.highlights.set_enabled(true);
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        assert_eq!(buf[(content, 0)].fg, Color::Reset); // 'a'
+        assert_eq!(buf[(content + 2, 0)].fg, Color::Green); // 'c'
+        assert_eq!(buf[(content + 5, 0)].fg, Color::Reset); // 'f'
+    }
+
+    /// The whole reason resolution is per attribute: a diagnostic in the lowest
+    /// layer and a token color in the one above it must both be visible on the
+    /// same character. With "highest layer wins wholesale" the underline — the
+    /// more urgent of the two — would be the one that disappears.
+    #[test]
+    fn a_diagnostic_underline_and_a_token_color_both_show() {
+        let lines = vec![String::from("abc")];
+        let mut state = ViewportState::default();
+        state.highlights.replace_layer(
+            LayerId::Base,
+            &[vec![StyledRun {
+                start: 0,
+                end: 2,
+                style: Style::new()
+                    .underline_color(Color::LightRed)
+                    .add_modifier(ratatui::style::Modifier::UNDERLINED),
+            }]],
+        );
+        state
+            .highlights
+            .replace_layer(LayerId::Semantic, &[vec![run_at(0, 3, Color::LightBlue)]]);
+        state.highlights.set_enabled(true);
+        let buf = render(&lines, &mut state, 12);
+
+        let content = gutter_width(lines.len()) as u16;
+        // 'a' and 'b': the token's foreground and the diagnostic's underline.
+        assert_eq!(buf[(content, 0)].fg, Color::LightBlue);
+        assert_eq!(buf[(content, 0)].underline_color, Color::LightRed);
+        assert_eq!(buf[(content + 1, 0)].fg, Color::LightBlue);
+        assert_eq!(buf[(content + 1, 0)].underline_color, Color::LightRed);
+        // 'c' is outside the diagnostic: colored, not underlined.
+        assert_eq!(buf[(content + 2, 0)].fg, Color::LightBlue);
+        assert_eq!(buf[(content + 2, 0)].underline_color, Color::Reset);
     }
 
     #[test]

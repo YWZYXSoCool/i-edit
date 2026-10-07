@@ -129,8 +129,19 @@ impl Document {
     /// Renders the section as lines, ready for
     /// [`write_text_file`](crate::fs::write_text_file).
     pub fn lines(&self, section: &str) -> Vec<String> {
-        let mut lines = Vec::with_capacity(self.entries.len() + 1);
+        self.lines_with_preamble(section, &[])
+    }
+
+    /// [`Self::lines`] with `preamble` written between the header and the
+    /// entries, verbatim.
+    ///
+    /// This is how the settings file carries comments explaining itself: the
+    /// parser skips every `#` line, so a section can ship documentation that
+    /// survives a write and can be edited or deleted by hand.
+    pub fn lines_with_preamble(&self, section: &str, preamble: &[&str]) -> Vec<String> {
+        let mut lines = Vec::with_capacity(self.entries.len() + 1 + preamble.len());
         lines.push(format!("{MAGIC} {section} v{FORMAT_VERSION}"));
+        lines.extend(preamble.iter().map(|line| (*line).to_string()));
 
         for (key, value) in &self.entries {
             lines.push(format!("{key} = {value}"));
@@ -187,6 +198,18 @@ mod tests {
     fn values_keep_their_spaces_apart_from_one_leading_one() {
         let doc = Document::parse(&lines("path =  /a b/c  \n"));
         assert_eq!(doc.get("path"), Some(" /a b/c  "));
+    }
+
+    #[test]
+    fn a_preamble_is_written_and_ignored_on_the_way_back() {
+        let mut doc = Document::new();
+        doc.set("flag", "true");
+
+        let lines = doc.lines_with_preamble("config", &["# what flag does"]);
+        let parsed = Document::parse(&lines);
+
+        assert_eq!(lines[1], "# what flag does");
+        assert_eq!(parsed, doc);
     }
 
     #[test]

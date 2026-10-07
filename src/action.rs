@@ -22,18 +22,28 @@ pub enum Action {
     LoadFile(PathBuf),
     /// Open `path` as the root of the file tree.
     LoadFolder(PathBuf),
+    /// Close the folder in the file tree, and the tabs that came from it.
+    CloseFolder,
+    /// Close the active tab.
+    CloseTab,
     /// Write the buffer back to its path, or ask for one when it has none.
     Save,
     /// Open the save-as picker.
     SaveAs,
     /// Write the buffer to a confirmed picker target.
     SaveTo(PathBuf),
+    /// Open the settings file in the editor, so the user can edit it by hand.
+    OpenSettings,
     /// Show or hide the file tree panel.
     ToggleFileTree,
     /// Clear every notification message.
     ClearMessages,
+    /// Throw the language server away and start a new one.
+    RestartLsp,
     /// Answer to the confirm popup.
     ConfirmChoice(ConfirmChoice),
+    NextTab,
+    PrevTab,
 }
 
 /// What the user picked in the confirm popup.

@@ -7,7 +7,7 @@
 //! | --------- | ------------ | ------------ | ------------------------------- |
 //! | `Config`  | `config`     | forever      | a setting changes               |
 //! | `State`   | `state`      | forever      | the MRU or a toggle changes     |
-//! | `Session` | `session`    | one run      | the buffer or cursor moves      |
+//! | `Session` | `session`    | one run      | the buffer, cursor or tabs move |
 //! | `Cache`   | `cache/dirs` | until stale  | listings change (if enabled)    |
 //!
 //! The split is what makes a bad file survivable: each section parses on its
@@ -169,6 +169,61 @@ impl Storage {
         self.mark_dirty(Section::Config);
     }
 
+    /// Path of the settings file, creating it from the current settings when it
+    /// is not on disk yet.
+    ///
+    /// This is the file the `settings` command opens for hand editing, so it has
+    /// to exist — and to be complete — before the editor reads it. A first run
+    /// therefore writes the defaults out instead of opening an empty buffer.
+    /// `None` means storage runs in memory and there is no file to edit.
+    pub fn ensure_settings_file(&mut self) -> Option<PathBuf> {
+        let root = self.root.clone()?;
+        let path = root.join(Section::Config.relative_path());
+
+        if !path.exists() {
+            // Written straight through rather than marked dirty: a debounced
+            // write would race the read that follows it.
+            let lines = self
+                .config
+                .to_doc()
+                .lines_with_preamble(Section::Config.name(), config::SETTINGS_HELP);
+
+            if let Err(err) = write_atomic(&path, &lines) {
+                log::warn!("storage: cannot create {}: {err}", path.display());
+            }
+        }
+
+        Some(path)
+    }
+
+    /// Whether `path` is the settings file this storage reads and writes.
+    pub fn is_settings_file(&self, path: &Path) -> bool {
+        match self.root.as_ref() {
+            Some(root) => path == root.join(Section::Config.relative_path()),
+            None => false,
+        }
+    }
+
+    /// Rereads the settings file from disk, dropping any pending write of it.
+    ///
+    /// Called after the file is saved from the editor: the user's edit is on
+    /// disk, so disk is the authority again and the in-memory copy is thrown
+    /// away along with the queued write it was going to make.
+    pub fn reload_config(&mut self) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+
+        self.config = Config::from_doc(&codec::Document::parse(&read_lines(
+            &root.join(Section::Config.relative_path()),
+        )));
+        self.dirty &= !Section::Config.bit();
+
+        if self.dirty == 0 {
+            self.dirty_since = None;
+        }
+    }
+
     /// Changes the durable state and schedules it for writing.
     pub fn edit_state(&mut self, edit: impl FnOnce(&mut State)) {
         edit(&mut self.state);
@@ -276,7 +331,10 @@ impl Storage {
         let path = root.join(section.relative_path());
 
         let lines = match section {
-            Section::Config => self.config.to_doc().lines(section.name()),
+            Section::Config => self
+                .config
+                .to_doc()
+                .lines_with_preamble(section.name(), config::SETTINGS_HELP),
             Section::State => self.state.to_doc().lines(section.name()),
             Section::Session => self.session.to_doc().lines(section.name()),
             Section::Cache => self.cache.to_lines(),
